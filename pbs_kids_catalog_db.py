@@ -1,443 +1,459 @@
 #!/usr/bin/env python3
-"""PBS KIDS multi-show catalog updater backed by SQLite.
-
-Phase 1 records catalog observations. Watch-page enrichment, media profiles,
-captions, and downloads are intentionally reserved for later phases.
-"""
 from __future__ import annotations
-
-import argparse
-import gzip
-import hashlib
-import json
-import logging
-import sqlite3
-import sys
-from dataclasses import asdict
+import argparse, configparser, gzip, hashlib, json, logging, sqlite3, sys
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
-
+from typing import Any, Sequence
 import pbs_kids_catalog_parser as parser
 
-APP_VERSION = "0.1.0"
-SCHEMA_VERSION = 1
-LOG = logging.getLogger("pbs_kids_catalog_db")
+APP_VERSION = "0.2.0"
 HERE = Path(__file__).resolve().parent
-DEFAULT_SCHEMA = HERE / "pbs_kids_catalog_schema.sql"
+DEFAULT_CONFIG = "pbs_kids_catalog.ini"
+LOG = logging.getLogger("pbs_kids_catalog")
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+@dataclass(frozen=True)
+class Settings:
+    config_path: Path
+    database: Path
+    snapshot_root: Path | None
+    log_level: str
+    timeout_seconds: float
+    user_agent: str
+    busy_timeout_ms: int
+    journal_mode: str
+    synchronous: str
 
 
-def canonical_hash(value: Any) -> str:
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
-def connect(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    return conn
-
-
-def initialize_database(db_path: Path, schema_path: Path = DEFAULT_SCHEMA) -> None:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    schema = schema_path.read_text(encoding="utf-8")
-    checksum = hashlib.sha256(schema.encode("utf-8")).hexdigest()
-    with connect(db_path) as conn:
-        conn.executescript(schema)
-        row = conn.execute("SELECT checksum FROM schema_migration WHERE version = ?", (SCHEMA_VERSION,)).fetchone()
-        if row and row["checksum"] != checksum:
-            raise RuntimeError("Schema migration 1 checksum differs from the applied migration.")
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migration(version, applied_at, description, checksum) VALUES (?, ?, ?, ?)",
-            (SCHEMA_VERSION, utc_now(), "Initial multi-show catalog schema", checksum),
-        )
-
-
-def add_show(conn: sqlite3.Connection, key: str, url: str, minimum_assets: int | None,
-             frequency: str | None, enabled: bool = True) -> int:
-    conn.execute(
-        """INSERT INTO show(canonical_key, catalog_url, enabled, expected_minimum_assets, retrieval_frequency)
-           VALUES (?, ?, ?, ?, ?)
-           ON CONFLICT(canonical_key) DO UPDATE SET
-             catalog_url=excluded.catalog_url,
-             enabled=excluded.enabled,
-             expected_minimum_assets=excluded.expected_minimum_assets,
-             retrieval_frequency=excluded.retrieval_frequency""",
-        (key, url, int(enabled), minimum_assets, frequency),
+def now():
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
     )
-    return int(conn.execute("SELECT show_id FROM show WHERE canonical_key = ?", (key,)).fetchone()[0])
 
 
-def get_show(conn: sqlite3.Connection, key: str) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM show WHERE canonical_key = ?", (key,)).fetchone()
-    if not row:
-        raise ValueError(f"Unknown show {key!r}. Add it with the add-show command.")
-    return row
+def sha(v):
+    return hashlib.sha256(
+        json.dumps(
+            v, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
 
 
-def resolve_asset(conn: sqlite3.Connection, run_id: int, video: parser.CatalogVideo) -> tuple[int | None, bool]:
-    identifiers = {
-        "media_manager_guid": video.guid or None,
-        "pbs_kids_cms_id": video.cms_id or None,
-        "legacy_tp_media_id": video.legacy_tp_media_id or None,
-    }
-    matches: set[int] = set()
-    for column, value in identifiers.items():
-        if value is None:
-            continue
-        rows = conn.execute(f"SELECT asset_id FROM asset WHERE {column} = ?", (value,)).fetchall()
-        matches.update(int(r[0]) for r in rows)
-
-    if len(matches) > 1:
-        conn.execute(
-            """INSERT INTO identity_conflict
-               (run_id, media_manager_guid, pbs_kids_cms_id, legacy_tp_media_id,
-                matched_asset_ids, source_record_json, detected_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (run_id, identifiers["media_manager_guid"], identifiers["pbs_kids_cms_id"],
-             identifiers["legacy_tp_media_id"], json.dumps(sorted(matches)),
-             json.dumps(asdict(video), sort_keys=True, ensure_ascii=False), utc_now()),
-        )
-        return None, True
-
-    if matches:
-        asset_id = next(iter(matches))
-        current = conn.execute("SELECT * FROM asset WHERE asset_id = ?", (asset_id,)).fetchone()
-        updates: dict[str, str] = {}
-        for column, value in identifiers.items():
-            if value and current[column] is None:
-                conflict = conn.execute(
-                    f"SELECT asset_id FROM asset WHERE {column} = ? AND asset_id <> ?", (value, asset_id)
-                ).fetchone()
-                if conflict:
-                    conn.execute(
-                        """INSERT INTO identity_conflict
-                           (run_id, media_manager_guid, pbs_kids_cms_id, legacy_tp_media_id,
-                            matched_asset_ids, source_record_json, detected_at)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (run_id, identifiers["media_manager_guid"], identifiers["pbs_kids_cms_id"],
-                         identifiers["legacy_tp_media_id"], json.dumps([asset_id, int(conflict[0])]),
-                         json.dumps(asdict(video), sort_keys=True, ensure_ascii=False), utc_now()),
-                    )
-                    return None, True
-                updates[column] = value
-            elif value and current[column] not in (None, value):
-                conn.execute(
-                    """INSERT INTO identity_conflict
-                       (run_id, media_manager_guid, pbs_kids_cms_id, legacy_tp_media_id,
-                        matched_asset_ids, source_record_json, detected_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (run_id, identifiers["media_manager_guid"], identifiers["pbs_kids_cms_id"],
-                     identifiers["legacy_tp_media_id"], json.dumps([asset_id]),
-                     json.dumps(asdict(video), sort_keys=True, ensure_ascii=False), utc_now()),
-                )
-                return None, True
-        if updates:
-            clause = ", ".join(f"{k} = ?" for k in updates)
-            conn.execute(f"UPDATE asset SET {clause} WHERE asset_id = ?", (*updates.values(), asset_id))
-        return asset_id, False
-
-    cur = conn.execute(
-        "INSERT INTO asset(media_manager_guid, pbs_kids_cms_id, legacy_tp_media_id) VALUES (?, ?, ?)",
-        (identifiers["media_manager_guid"], identifiers["pbs_kids_cms_id"], identifiers["legacy_tp_media_id"]),
-    )
-    return int(cur.lastrowid), False
+def path_value(raw: str | None, base: Path, default: Path | None) -> Path | None:
+    if raw is None or not raw.strip():
+        return default
+    p = Path(raw).expanduser()
+    return p if p.is_absolute() else base / p
 
 
-def snapshot_html(snapshot_root: Path | None, key: str, observed_at: str, html: str) -> str | None:
-    if snapshot_root is None:
-        return None
-    dt = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
-    relative = Path(f"{dt:%Y/%m}") / f"{dt:%Y%m%dT%H%M%S}-{key}-catalog.html.gz"
-    target = snapshot_root / relative
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(target.suffix + ".tmp")
-    with gzip.open(temp, "wt", encoding="utf-8") as handle:
-        handle.write(html)
-    temp.replace(target)
-    return relative.as_posix()
-
-
-def ingest_catalog(conn: sqlite3.Connection, show: sqlite3.Row, html: str, observed_at: str,
-                   snapshot_path: str | None, http_status: int | None = None,
-                   etag: str | None = None, last_modified: str | None = None) -> int:
-    response_hash = hashlib.sha256(html.encode("utf-8")).hexdigest()
-    source_url = str(show["catalog_url"])
-    try:
-        catalog = parser.parse_catalog_html(html, source_url=source_url)
-        parse_error = None
-    except Exception as exc:
-        catalog = None
-        parse_error = str(exc)
-
-    with conn:
-        cur = conn.execute(
-            """INSERT INTO catalog_run
-               (show_id, observed_at, source_url, http_status, response_sha256,
-                response_etag, response_last_modified, snapshot_relative_path,
-                next_build_id, parser_version, retrieval_succeeded, parse_succeeded,
-                catalog_complete, error_message)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, ?)""",
-            (show["show_id"], observed_at, source_url, http_status, response_hash, etag,
-             last_modified, snapshot_path,
-             catalog.metadata.next_build_id if catalog else None,
-             APP_VERSION, int(catalog is not None), parse_error),
-        )
-        run_id = int(cur.lastrowid)
-        if catalog is None:
-            return run_id
-
-        show_value = {"source_slug": catalog.metadata.page_slug, "source_title": catalog.metadata.page_title}
-        conn.execute(
-            "INSERT INTO show_observation(run_id, show_id, source_slug, source_title, nola_root, metadata_hash) VALUES (?, ?, ?, ?, NULL, ?)",
-            (run_id, show["show_id"], catalog.metadata.page_slug,
-             catalog.metadata.page_title or show["canonical_key"], canonical_hash(show_value)),
-        )
-
-        collection_map: dict[tuple[str, str], int] = {}
-        collection_positions: dict[tuple[str, str], dict[str, int]] = {}
-        conflicts = 0
-
-        for video in catalog.videos:
-            asset_id, conflicted = resolve_asset(conn, run_id, video)
-            if conflicted or asset_id is None:
-                conflicts += 1
-                continue
-            metadata = {
-                "slug": video.slug, "title": video.title, "video_type": video.video_type,
-                "description_short": video.description_short,
-                "duration_seconds": video.duration_seconds,
-                "source_premiered_at": video.premiered_on_utc,
-            }
-            conn.execute(
-                """INSERT INTO asset_observation
-                   (run_id, asset_id, slug, title, video_type, description_short,
-                    duration_seconds, source_premiered_at, metadata_hash)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (run_id, asset_id, video.slug, video.title, video.video_type,
-                 video.description_short, video.duration_seconds, video.premiered_on_utc,
-                 canonical_hash(metadata)),
-            )
-            conn.execute(
-                "INSERT INTO asset_show_observation(run_id, show_id, asset_id) VALUES (?, ?, ?)",
-                (run_id, show["show_id"], asset_id),
-            )
-            for image in video.images:
-                conn.execute(
-                    "INSERT INTO asset_image_observation(run_id, asset_id, profile, image_url) VALUES (?, ?, ?, ?)",
-                    (run_id, asset_id, image.profile, image.url),
-                )
-
-            for membership in video.memberships:
-                key = (membership.id, membership.slug)
-                if key not in collection_map:
-                    existing = conn.execute(
-                        "SELECT collection_id, show_id FROM collection WHERE pbs_collection_id = ?", (membership.id,)
-                    ).fetchone()
-                    if existing and int(existing["show_id"]) != int(show["show_id"]):
-                        raise RuntimeError(f"PBS collection {membership.id} is already owned by another show")
-                    if existing:
-                        collection_id = int(existing["collection_id"])
-                    else:
-                        collection_id = int(conn.execute(
-                            "INSERT INTO collection(show_id, pbs_collection_id) VALUES (?, ?)",
-                            (show["show_id"], membership.id),
-                        ).lastrowid)
-                    collection_map[key] = collection_id
-                    value = {"slug": membership.slug, "title": membership.title, "heading": membership.heading}
-                    conn.execute(
-                        """INSERT INTO collection_observation
-                           (run_id, collection_id, slug, title, heading, metadata_hash)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (run_id, collection_id, membership.slug, membership.title,
-                         membership.heading, canonical_hash(value)),
-                    )
-                    collection_positions[key] = {}
-                collection_id = collection_map[key]
-                # Deduplicate body/masthead repetitions. First occurrence determines order.
-                if video.guid not in collection_positions[key]:
-                    position = len(collection_positions[key])
-                    collection_positions[key][video.guid] = position
-                    conn.execute(
-                        """INSERT INTO membership_observation
-                           (run_id, collection_id, asset_id, ordinal_position, watch_url)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        (run_id, collection_id, asset_id, position, membership.watch_url),
-                    )
-
-        observed_assets = conn.execute(
-            "SELECT COUNT(*) FROM asset_observation WHERE run_id = ?", (run_id,)
-        ).fetchone()[0]
-        required = {r[0] for r in conn.execute(
-            "SELECT collection_slug FROM show_required_collection WHERE show_id = ?", (show["show_id"],)
-        )}
-        observed_collections = {r[0] for r in conn.execute(
-            """SELECT co.slug FROM collection_observation co WHERE co.run_id = ?""", (run_id,)
-        )}
-        minimum = show["expected_minimum_assets"]
-        complete = conflicts == 0 and observed_assets > 0
-        if minimum is not None:
-            complete = complete and observed_assets >= int(minimum)
-        complete = complete and required.issubset(observed_collections)
-        message_parts = []
-        if conflicts:
-            message_parts.append(f"{conflicts} identity conflict(s)")
-        if minimum is not None and observed_assets < int(minimum):
-            message_parts.append(f"asset count {observed_assets} below minimum {minimum}")
-        missing = sorted(required - observed_collections)
-        if missing:
-            message_parts.append("missing required collections: " + ", ".join(missing))
-        conn.execute(
-            "UPDATE catalog_run SET catalog_complete = ?, error_message = ? WHERE run_id = ?",
-            (int(complete), "; ".join(message_parts) or None, run_id),
-        )
-        return run_id
-
-
-def record_retrieval_failure(conn: sqlite3.Connection, show: sqlite3.Row, observed_at: str, error: str) -> int:
-    with conn:
-        cur = conn.execute(
-            """INSERT INTO catalog_run
-               (show_id, observed_at, source_url, parser_version, retrieval_succeeded,
-                parse_succeeded, catalog_complete, error_message)
-               VALUES (?, ?, ?, ?, 0, 0, 0, ?)""",
-            (show["show_id"], observed_at, show["catalog_url"], APP_VERSION, error),
-        )
-        return int(cur.lastrowid)
-
-
-def update_show(db_path: Path, key: str, html_path: Path | None,
-                snapshot_root: Path | None, observed_at: str | None) -> int:
-    initialize_database(db_path)
-    observed_at = observed_at or utc_now()
-    with connect(db_path) as conn:
-        show = get_show(conn, key)
-        if not show["enabled"]:
-            raise ValueError(f"Show {key!r} is disabled.")
+def load_settings(argv: Sequence[str] | None = None) -> tuple[Settings, list[str]]:
+    args = list(argv if argv is not None else sys.argv[1:])
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=DEFAULT_CONFIG)
+    ns, remaining = pre.parse_known_args(args)
+    cp = Path(ns.config).expanduser()
+    explicit = "--config" in args
+    if not cp.is_absolute():
+        cp = Path.cwd() / cp
+    cfg = configparser.ConfigParser(interpolation=None)
+    if cp.exists():
         try:
-            if html_path:
-                html = html_path.read_text(encoding="utf-8")
-                http_status = None
-                etag = last_modified = None
-            else:
-                if parser.httpx is None:
-                    raise RuntimeError("Live retrieval requires httpx")
-                headers = {"User-Agent": parser.USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-                with parser.httpx.Client(headers=headers, follow_redirects=True, timeout=30.0) as client:
-                    response = client.get(show["catalog_url"])
-                    response.raise_for_status()
-                    html = response.text
-                    http_status = response.status_code
-                    etag = response.headers.get("etag")
-                    last_modified = response.headers.get("last-modified")
-            relative = snapshot_html(snapshot_root, key, observed_at, html)
-            return ingest_catalog(conn, show, html, observed_at, relative, http_status, etag, last_modified)
-        except Exception as exc:
-            run_id = record_retrieval_failure(conn, show, observed_at, str(exc))
-            raise RuntimeError(f"Run {run_id} failed: {exc}") from exc
+            with cp.open(encoding="utf-8") as f:
+                cfg.read_file(f)
+        except (configparser.Error, OSError) as e:
+            raise ValueError(f"Cannot read configuration {cp}: {e}") from e
+    elif explicit:
+        raise ValueError(f"Configuration file not found: {cp}")
+    base = cp.parent
+
+    def get(sec, key, default):
+        return cfg.get(sec, key, fallback=default)
+
+    try:
+        s = Settings(
+            cp,
+            path_value(
+                get("application", "database", "pbs-kids-catalog.sqlite3"), base, None
+            ),
+            path_value(get("application", "snapshot_root", ""), base, None),
+            get("application", "log_level", "INFO").upper(),
+            float(get("http", "timeout_seconds", "30")),
+            get("http", "user_agent", "PBSKidsCatalog/0.2"),
+            int(get("sqlite", "busy_timeout_ms", "5000")),
+            get("sqlite", "journal_mode", "WAL").upper(),
+            get("sqlite", "synchronous", "NORMAL").upper(),
+        )
+    except ValueError as e:
+        raise ValueError(f"Invalid value in {cp}: {e}") from e
+    if s.log_level not in logging._nameToLevel:
+        raise ValueError(f"Invalid log_level: {s.log_level}")
+    if s.journal_mode not in {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}:
+        raise ValueError(f"Invalid journal_mode: {s.journal_mode}")
+    if s.synchronous not in {"OFF", "NORMAL", "FULL", "EXTRA"}:
+        raise ValueError(f"Invalid synchronous: {s.synchronous}")
+    return s, remaining
 
 
-def print_rows(rows: Iterable[sqlite3.Row]) -> None:
-    for row in rows:
-        print(json.dumps(dict(row), ensure_ascii=False, sort_keys=True))
+def connect(path: Path, s: Settings):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(path, timeout=s.busy_timeout_ms / 1000)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    c.execute(f"PRAGMA journal_mode={s.journal_mode}")
+    c.execute(f"PRAGMA synchronous={s.synchronous}")
+    c.execute(f"PRAGMA busy_timeout={s.busy_timeout_ms}")
+    return c
 
 
-def build_cli() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Maintain a multi-show PBS KIDS catalog in SQLite.")
-    ap.add_argument("--db", type=Path, default=Path("pbs-kids-catalog.sqlite3"))
-    ap.add_argument("--verbose", action="store_true")
+def init_db(path: Path, s: Settings):
+    sql = (HERE / "pbs_kids_catalog_schema.sql").read_text()
+    h = hashlib.sha256(sql.encode()).hexdigest()
+    with connect(path, s) as c:
+        c.executescript(sql)
+        r = c.execute(
+            "SELECT checksum FROM schema_migration WHERE version=1"
+        ).fetchone()
+        if r and r[0] != h:
+            raise RuntimeError("Schema migration checksum mismatch")
+        c.execute(
+            "INSERT OR IGNORE INTO schema_migration VALUES(1,?,?,?)",
+            (now(), "Initial schema", h),
+        )
+
+
+def show(c, key):
+    r = c.execute("SELECT * FROM show WHERE canonical_key=?", (key,)).fetchone()
+    if not r:
+        raise ValueError(f"Unknown show {key!r}")
+    return r
+
+
+def asset(c, v):
+    ids = (v.guid, v.cms_id, v.legacy_tp_media_id)
+    matches = set()
+    for col, val in zip(
+        ("media_manager_guid", "pbs_kids_cms_id", "legacy_tp_media_id"), ids
+    ):
+        if val:
+            matches |= {
+                r[0]
+                for r in c.execute(f"SELECT asset_id FROM asset WHERE {col}=?", (val,))
+            }
+    if len(matches) > 1:
+        return None, matches
+    if matches:
+        return next(iter(matches)), set()
+    return (
+        c.execute(
+            "INSERT INTO asset(media_manager_guid,pbs_kids_cms_id,legacy_tp_media_id) VALUES(?,?,?)",
+            ids,
+        ).lastrowid,
+        set(),
+    )
+
+
+def snapshot(root: Path | None, key: str, stamp: str, html: str):
+    if not root:
+        return None
+    d = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    rel = Path(f"{d:%Y/%m}/{d:%Y%m%dT%H%M%S}-{key}.html.gz")
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(p, "wt", encoding="utf-8") as f:
+        f.write(html)
+    return rel.as_posix()
+
+
+def ingest(c, sh, html, stamp, snap, http_status=None, etag=None, last_modified=None):
+    cat = parser.parse_catalog_html(html, str(sh["catalog_url"]))
+    rh = hashlib.sha256(html.encode()).hexdigest()
+    with c:
+        run = c.execute(
+            """INSERT INTO catalog_run(show_id,observed_at,source_url,http_status,response_sha256,response_etag,response_last_modified,snapshot_relative_path,next_build_id,parser_version,retrieval_succeeded,parse_succeeded,catalog_complete) VALUES(?,?,?,?,?,?,?,?,?,?,1,1,0)""",
+            (
+                sh["show_id"],
+                stamp,
+                sh["catalog_url"],
+                http_status,
+                rh,
+                etag,
+                last_modified,
+                snap,
+                cat.metadata.next_build_id,
+                APP_VERSION,
+            ),
+        ).lastrowid
+        sv = {"slug": cat.metadata.page_slug, "title": cat.metadata.page_title}
+        c.execute(
+            "INSERT INTO show_observation VALUES(?,?,?,?,?)",
+            (
+                run,
+                sh["show_id"],
+                cat.metadata.page_slug,
+                cat.metadata.page_title or sh["canonical_key"],
+                sha(sv),
+            ),
+        )
+        collections = {}
+        positions = {}
+        conflicts = 0
+        for v in cat.videos:
+            aid, bad = asset(c, v)
+            if bad:
+                conflicts += 1
+                c.execute(
+                    "INSERT INTO identity_conflict(run_id,media_manager_guid,pbs_kids_cms_id,legacy_tp_media_id,matched_asset_ids,source_record_json,detected_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        run,
+                        v.guid,
+                        v.cms_id,
+                        v.legacy_tp_media_id,
+                        json.dumps(sorted(bad)),
+                        json.dumps(asdict(v)),
+                        now(),
+                    ),
+                )
+                continue
+            md = {
+                "slug": v.slug,
+                "title": v.title,
+                "video_type": v.video_type,
+                "description_short": v.description_short,
+                "duration_seconds": v.duration_seconds,
+                "source_premiered_at": v.premiered_on_utc,
+            }
+            c.execute(
+                "INSERT INTO asset_observation VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    run,
+                    aid,
+                    v.slug,
+                    v.title,
+                    v.video_type,
+                    v.description_short,
+                    v.duration_seconds,
+                    v.premiered_on_utc,
+                    sha(md),
+                ),
+            )
+            c.execute(
+                "INSERT INTO asset_show_observation VALUES(?,?,?)",
+                (run, sh["show_id"], aid),
+            )
+            for im in v.images:
+                c.execute(
+                    "INSERT OR IGNORE INTO asset_image_observation VALUES(?,?,?,?)",
+                    (run, aid, im.profile, im.url),
+                )
+            for m in v.memberships:
+                if m.id not in collections:
+                    r = c.execute(
+                        "SELECT collection_id,show_id FROM collection WHERE pbs_collection_id=?",
+                        (m.id,),
+                    ).fetchone()
+                    if r and r["show_id"] != sh["show_id"]:
+                        raise RuntimeError(f"Collection {m.id} belongs to another show")
+                    cid = (
+                        r["collection_id"]
+                        if r
+                        else c.execute(
+                            "INSERT INTO collection(show_id,pbs_collection_id) VALUES(?,?)",
+                            (sh["show_id"], m.id),
+                        ).lastrowid
+                    )
+                    collections[m.id] = cid
+                    positions[m.id] = {}
+                    q = {"slug": m.slug, "title": m.title, "heading": m.heading}
+                    c.execute(
+                        "INSERT INTO collection_observation VALUES(?,?,?,?,?,?)",
+                        (run, cid, m.slug, m.title, m.heading, sha(q)),
+                    )
+                if aid not in positions[m.id]:
+                    pos = len(positions[m.id])
+                    positions[m.id][aid] = pos
+                    c.execute(
+                        "INSERT INTO membership_observation VALUES(?,?,?,?,?)",
+                        (run, collections[m.id], aid, pos, m.watch_url),
+                    )
+        n = c.execute(
+            "SELECT count(*) FROM asset_observation WHERE run_id=?", (run,)
+        ).fetchone()[0]
+        required = {
+            r[0]
+            for r in c.execute(
+                "SELECT collection_slug FROM show_required_collection WHERE show_id=?",
+                (sh["show_id"],),
+            )
+        }
+        got = {
+            r[0]
+            for r in c.execute(
+                "SELECT slug FROM collection_observation WHERE run_id=?", (run,)
+            )
+        }
+        minimum = sh["expected_minimum_assets"]
+        ok = (
+            not conflicts
+            and n > 0
+            and (minimum is None or n >= minimum)
+            and required <= got
+        )
+        errs = []
+        if conflicts:
+            errs.append(f"{conflicts} identity conflict(s)")
+        if minimum is not None and n < minimum:
+            errs.append(f"asset count {n} below minimum {minimum}")
+        if required - got:
+            errs.append(
+                "missing required collections: " + ",".join(sorted(required - got))
+            )
+        c.execute(
+            "UPDATE catalog_run SET catalog_complete=?,error_message=? WHERE run_id=?",
+            (int(ok), "; ".join(errs) or None, run),
+        )
+        return run
+
+
+def retrieve(sh, s):
+    if parser.httpx is None:
+        raise RuntimeError("Live retrieval requires httpx")
+    with parser.httpx.Client(
+        headers={"User-Agent": s.user_agent, "Accept": "text/html"},
+        follow_redirects=True,
+        timeout=s.timeout_seconds,
+    ) as client:
+        r = client.get(sh["catalog_url"])
+        r.raise_for_status()
+        return (
+            r.text,
+            r.status_code,
+            r.headers.get("etag"),
+            r.headers.get("last-modified"),
+        )
+
+
+def cli(settings, argv):
+    ap = argparse.ArgumentParser(description="Maintain the PBS KIDS SQLite catalog.")
+    ap.add_argument("--db", type=Path, default=None)
+    ap.add_argument("--snapshot-root", type=Path, default=None)
+    ap.add_argument("--log-level", choices=sorted(logging._nameToLevel), default=None)
     sub = ap.add_subparsers(dest="command", required=True)
-    sub.add_parser("init", help="Create or upgrade the database schema.")
-
-    p = sub.add_parser("add-show", help="Add or update a show configuration.")
+    sub.add_parser("init")
+    p = sub.add_parser("add-show")
     p.add_argument("key")
     p.add_argument("url")
     p.add_argument("--minimum-assets", type=int)
     p.add_argument("--frequency")
     p.add_argument("--disabled", action="store_true")
-
-    p = sub.add_parser("require-collection", help="Require a collection for completeness.")
+    p = sub.add_parser("require-collection")
     p.add_argument("key")
     p.add_argument("collection_slug")
-
-    p = sub.add_parser("update", help="Retrieve or import one show catalog.")
+    p = sub.add_parser("update")
     p.add_argument("key")
     p.add_argument("--html", type=Path)
-    p.add_argument("--snapshot-root", type=Path)
-    p.add_argument("--observed-at", help="UTC ISO-8601 timestamp; defaults to now.")
-
+    p.add_argument("--observed-at")
     sub.add_parser("list-shows")
     p = sub.add_parser("runs")
     p.add_argument("--key")
     p.add_argument("--limit", type=int, default=20)
     p = sub.add_parser("current")
     p.add_argument("key")
-    return ap
+    return ap.parse_args(argv)
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = build_cli().parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(levelname)s: %(message)s")
+def main(argv: Sequence[str] | None = None):
     try:
-        if args.command == "init":
-            initialize_database(args.db)
-            print(f"Initialized {args.db}")
-            return 0
-        initialize_database(args.db)
-        if args.command == "add-show":
-            with connect(args.db) as conn:
-                show_id = add_show(conn, args.key, args.url, args.minimum_assets,
-                                   args.frequency, not args.disabled)
-            print(f"show_id={show_id}")
-        elif args.command == "require-collection":
-            with connect(args.db) as conn:
-                show = get_show(conn, args.key)
-                conn.execute("INSERT OR IGNORE INTO show_required_collection(show_id, collection_slug) VALUES (?, ?)",
-                             (show["show_id"], args.collection_slug))
-            print("Requirement saved")
-        elif args.command == "update":
-            run_id = update_show(args.db, args.key, args.html, args.snapshot_root, args.observed_at)
-            with connect(args.db) as conn:
-                row = conn.execute("SELECT * FROM catalog_run WHERE run_id = ?", (run_id,)).fetchone()
-            print(json.dumps(dict(row), ensure_ascii=False, sort_keys=True))
-        elif args.command == "list-shows":
-            with connect(args.db) as conn:
-                print_rows(conn.execute("SELECT * FROM show ORDER BY canonical_key"))
-        elif args.command == "runs":
-            with connect(args.db) as conn:
-                if args.key:
-                    rows = conn.execute(
-                        """SELECT cr.*, s.canonical_key FROM catalog_run cr JOIN show s USING(show_id)
-                           WHERE s.canonical_key = ? ORDER BY cr.observed_at DESC, cr.run_id DESC LIMIT ?""",
-                        (args.key, args.limit),
-                    )
-                else:
-                    rows = conn.execute(
-                        """SELECT cr.*, s.canonical_key FROM catalog_run cr JOIN show s USING(show_id)
-                           ORDER BY cr.observed_at DESC, cr.run_id DESC LIMIT ?""", (args.limit,)
-                    )
-                print_rows(rows)
-        elif args.command == "current":
-            with connect(args.db) as conn:
-                rows = conn.execute(
-                    """SELECT c.* FROM current_catalog_by_show c JOIN show s USING(show_id)
-                       WHERE s.canonical_key = ? ORDER BY c.video_type, c.title""", (args.key,)
+        s, rest = load_settings(argv)
+        a = cli(s, rest)
+        logging.basicConfig(
+            level=getattr(logging, a.log_level or s.log_level),
+            format="%(levelname)s: %(message)s",
+        )
+        db = a.db.expanduser() if a.db else s.database
+        sr = a.snapshot_root.expanduser() if a.snapshot_root else s.snapshot_root
+        init_db(db, s)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    try:
+        if a.command == "init":
+            print(f"Initialized {db}")
+        elif a.command == "add-show":
+            with connect(db, s) as c:
+                c.execute(
+                    """INSERT INTO show(canonical_key,catalog_url,enabled,expected_minimum_assets,retrieval_frequency) VALUES(?,?,?,?,?) ON CONFLICT(canonical_key) DO UPDATE SET catalog_url=excluded.catalog_url,enabled=excluded.enabled,expected_minimum_assets=excluded.expected_minimum_assets,retrieval_frequency=excluded.retrieval_frequency""",
+                    (a.key, a.url, int(not a.disabled), a.minimum_assets, a.frequency),
                 )
-                print_rows(rows)
+                print(f"Configured {a.key}")
+        elif a.command == "require-collection":
+            with connect(db, s) as c:
+                sh = show(c, a.key)
+                c.execute(
+                    "INSERT OR IGNORE INTO show_required_collection VALUES(?,?)",
+                    (sh["show_id"], a.collection_slug),
+                )
+                print("Requirement saved")
+        elif a.command == "update":
+            stamp = a.observed_at or now()
+            with connect(db, s) as c:
+                sh = show(c, a.key)
+                if not sh["enabled"]:
+                    raise ValueError(f"Show {a.key} is disabled")
+                if a.html:
+                    html = a.html.read_text()
+                    status = etag = modified = None
+                else:
+                    html, status, etag, modified = retrieve(sh, s)
+                run = ingest(
+                    c,
+                    sh,
+                    html,
+                    stamp,
+                    snapshot(sr, a.key, stamp, html),
+                    status,
+                    etag,
+                    modified,
+                )
+                print(
+                    json.dumps(
+                        dict(
+                            c.execute(
+                                "SELECT * FROM catalog_run WHERE run_id=?", (run,)
+                            ).fetchone()
+                        ),
+                        sort_keys=True,
+                    )
+                )
+        elif a.command == "list-shows":
+            with connect(db, s) as c:
+                for r in c.execute("SELECT * FROM show ORDER BY canonical_key"):
+                    print(json.dumps(dict(r), sort_keys=True))
+        elif a.command == "runs":
+            with connect(db, s) as c:
+                q = "SELECT cr.*,s.canonical_key FROM catalog_run cr JOIN show s USING(show_id)"
+                params = []
+                if a.key:
+                    q += " WHERE s.canonical_key=?"
+                    params.append(a.key)
+                q += " ORDER BY observed_at DESC,run_id DESC LIMIT ?"
+                params.append(a.limit)
+                for r in c.execute(q, params):
+                    print(json.dumps(dict(r), sort_keys=True))
+        elif a.command == "current":
+            with connect(db, s) as c:
+                for r in c.execute(
+                    "SELECT v.* FROM current_catalog_by_show v JOIN show s USING(show_id) WHERE s.canonical_key=? ORDER BY title",
+                    (a.key,),
+                ):
+                    print(json.dumps(dict(r), sort_keys=True))
         return 0
-    except Exception as exc:
-        LOG.error("%s", exc)
+    except Exception as e:
+        LOG.error("%s", e)
         return 2
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

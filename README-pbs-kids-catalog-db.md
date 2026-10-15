@@ -1,134 +1,93 @@
-# PBS KIDS multi-show catalog database
+# PBS KIDS catalog database
 
-This phase implements the SQLite catalog defined in `pbs-kids-catalog-database-design.md`.
-It records append-only observations for configured PBS KIDS shows. It does not yet retrieve watch-page media profiles, captions, or video files.
+## Configuration
 
-## Files
+The program looks for `pbs_kids_catalog.ini` in the current working directory. If the default file is absent, built-in defaults are used. An explicitly requested missing file is an error.
 
-- `pbs_kids_catalog_db.py`: database CLI and ingestion service
-- `pbs_kids_catalog_parser.py`: generic Next.js catalog parser
-- `pbs_kids_catalog_schema.sql`: SQLite schema, indexes, and current-state views
-- `test_pbs_kids_catalog_db.py`: database and ingestion tests
-- `pbs-kids-catalog.sqlite3`: sample database populated from the supplied Odd Squad fixture
-
-## Requirements
-
-- Python 3.11 or later recommended
-- `httpx` for live retrieval
-- SQLite supplied by Python's standard library
+Use a different file with the global `--config` option:
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install 'httpx>=0.27,<1'
+python pbs_kids_catalog_db.py --config /etc/pbs-kids/catalog.ini init
 ```
 
-Keep the Python and SQL files in the same directory.
+Example:
 
-## Initialize
+```ini
+[application]
+database = data/pbs-kids-catalog.sqlite3
+snapshot_root = data/snapshots
+log_level = INFO
+
+[http]
+timeout_seconds = 30
+user_agent = PBSKidsCatalog/0.2 (+personal catalog synchronization)
+
+[sqlite]
+busy_timeout_ms = 5000
+journal_mode = WAL
+synchronous = NORMAL
+```
+
+Relative `database` and `snapshot_root` values are resolved relative to the INI file's directory, not the process working directory. An empty `snapshot_root` disables source snapshots.
+
+Precedence is:
+
+1. command-line option
+2. INI setting
+3. built-in default
+
+The following stable operational settings can be overridden on the command line:
 
 ```bash
 python pbs_kids_catalog_db.py \
-  --db pbs-kids-catalog.sqlite3 \
+  --config pbs_kids_catalog.ini \
+  --db /tmp/catalog.sqlite3 \
+  --snapshot-root /tmp/snapshots \
+  --log-level DEBUG \
   init
 ```
 
-## Configure a show
-
-The URL must be verified during onboarding.
+## Initialize and configure
 
 ```bash
-python pbs_kids_catalog_db.py \
-  --db pbs-kids-catalog.sqlite3 \
-  add-show odd-squad \
-  'https://pbskids.org/videos/odd-squad' \
+python pbs_kids_catalog_db.py init
+
+python pbs_kids_catalog_db.py add-show \
+  odd-squad \
+  https://pbskids.org/videos/odd-squad \
   --minimum-assets 80 \
   --frequency daily
+
+python pbs_kids_catalog_db.py require-collection \
+  odd-squad odd-squad-full-episodes
 ```
 
-Optionally require a structurally expected collection before a run can be marked complete:
+## Update from saved HTML
 
 ```bash
-python pbs_kids_catalog_db.py \
-  --db pbs-kids-catalog.sqlite3 \
-  require-collection odd-squad odd-squad-full-episodes
-```
-
-Other shows use the same commands, with independently verified keys, URLs, minimum counts, and required collections.
-
-## Import a saved HTML fixture
-
-```bash
-python pbs_kids_catalog_db.py \
-  --db pbs-kids-catalog.sqlite3 \
-  update odd-squad \
+python pbs_kids_catalog_db.py update odd-squad \
   --html odd-squad.html \
-  --observed-at '2026-10-15T03:22:57.000Z' \
-  --snapshot-root snapshots
+  --observed-at 2026-10-15T03:22:57.000Z
 ```
 
-## Retrieve the current page
-
-Omit `--html`:
+## Live update
 
 ```bash
-python pbs_kids_catalog_db.py \
-  --db pbs-kids-catalog.sqlite3 \
-  update odd-squad \
-  --snapshot-root snapshots
+python pbs_kids_catalog_db.py update odd-squad
 ```
 
-## Inspect configuration and runs
+## Inspection
 
 ```bash
-python pbs_kids_catalog_db.py --db pbs-kids-catalog.sqlite3 list-shows
-python pbs_kids_catalog_db.py --db pbs-kids-catalog.sqlite3 runs --key odd-squad
+python pbs_kids_catalog_db.py list-shows
+python pbs_kids_catalog_db.py runs --key odd-squad
+python pbs_kids_catalog_db.py current odd-squad
 ```
 
-## Inspect current observations
+## Tests
 
 ```bash
-python pbs_kids_catalog_db.py \
-  --db pbs-kids-catalog.sqlite3 \
-  current odd-squad
+python -m unittest -v test_pbs_kids_catalog_config.py
 ```
 
-The `current_catalog_by_show` view uses the latest successful, complete run for each show. Incomplete runs remain in history but do not replace current state.
-
-## Run tests
-
-Keep `odd-squad.html` beside the test file:
-
-```bash
-python -m unittest -v test_pbs_kids_catalog_db.py
-```
-
-The tests verify:
-
-- initial identity and observation counts
-- foreign-key and database integrity
-- append-only behavior across two runs
-- stable identity reuse
-- show completeness thresholds
-- current-state exclusion of incomplete runs
-
-## Important operating rules
-
-- A missing row means absence only for a successful, complete run of the same show.
-- Each show is updated in its own transaction and has independent completeness rules.
-- Do not manually update observation rows.
-- Do not reuse another show's thresholds or required collections without onboarding evidence.
-- Back up active databases with the SQLite backup API or `VACUUM INTO`.
-- Preserve failed source snapshots until parser problems are resolved.
-
-## Phase 2 extension points
-
-The next phase can add separate run and observation tables for:
-
-- watch-page enrichment
-- source expiry and DRM status
-- media profiles and PBS URS redirects
-- caption tracks
-- download attempts and verified artifacts
-
-Catalog-run absence will not be interpreted as caption or media-profile absence.
+Phase 2 remains reserved for watch-page details, media profiles, captions, and downloads.
