@@ -1,4 +1,4 @@
-# Odd Squad Catalog Database Design
+# PBS KIDS Multi-Show Catalog Database Design
 
 **Document status:** Proposed baseline design  
 **Database platform:** SQLite 3  
@@ -7,7 +7,7 @@
 
 ## 1. Executive Summary
 
-This document defines the SQLite database design for an application that periodically retrieves the PBS KIDS Odd Squad catalog, parses the embedded Next.js JSON, and records what assets and collection memberships were observed during each successful catalog run.
+This document defines the SQLite database design for an application that periodically retrieves multiple PBS KIDS show catalogs, parses their embedded Next.js JSON, and records which shows, assets, collections, and memberships were observed during each successful catalog run. Initial target shows include Odd Squad, Sesame Street, Daniel Tiger, Wild Kratts, and Curious George.
 
 The design uses an **append-only observation model with stable internal identities**. It does not use a bitemporal model because the source generally establishes only that a fact was observed at a crawl time. It does not establish the exact real-world interval during which titles, descriptions, artwork, or collection membership were valid.
 
@@ -38,7 +38,7 @@ The database shall support the following capabilities:
 - Identify the same PBS video across multiple runs.
 - Track changes to titles, descriptions, duration, classification, imagery, and collection membership.
 - Determine what the application observed during any prior successful run.
-- Detect assets added to or removed from the overall catalog.
+- Detect assets added to or removed from the applicable show catalog.
 - Detect assets rotating into or out of individual collections.
 - Support idempotent reprocessing of a previously stored source snapshot.
 - Provide a stable foundation for later watch-page, caption, media, and download features.
@@ -69,7 +69,7 @@ Design and implementation decisions shall be evaluated in this order:
 
 ### 3.1 Catalog run
 
-A **catalog run** is one attempt to retrieve and parse a defined catalog source URL. A run records retrieval status, parse status, completeness status, parser version, and response provenance.
+A **catalog run** is one attempt to retrieve and parse one configured show catalog source URL. A run records retrieval status, parse status, completeness status, parser version, and response provenance.
 
 A run may be:
 
@@ -85,6 +85,28 @@ Only successful, complete runs may be used to infer absence.
 **Observation time** is the UTC timestamp assigned to a catalog run. It represents when the source response was obtained for interpretation.
 
 Observation time does not mean that the observed catalog state began at that moment.
+
+### 3.3 Show
+
+A **show** is the stable internal representation of a PBS KIDS program, such as Odd Squad, Sesame Street, Daniel Tiger, Wild Kratts, or Curious George.
+
+A show has:
+
+- an internal SQLite `show_id`;
+- a governed canonical key used by the application;
+- one or more observed PBS slugs or source URLs;
+- an enablement status and retrieval policy;
+- show-specific validation thresholds.
+
+Show title and source slug are observed attributes because PBS may revise them. The registry retains only the internal identity and governed canonical key.
+
+### 3.4 Show observation
+
+A **show observation** states:
+
+> During catalog run R, show S was returned with the recorded title, slug, and catalog-page attributes.
+
+A catalog run belongs to exactly one show. This prevents absence in one show from being inferred from a run against another show.
 
 ### 3.3 Asset
 
@@ -104,7 +126,7 @@ An **asset observation** states:
 
 > During catalog run R, asset A was returned with the recorded attributes.
 
-The presence of an asset-observation row establishes positive observation in the overall catalog for that run.
+The presence of an asset-observation row establishes positive observation in the applicable show catalog for that run.
 
 ### 3.5 Collection
 
@@ -124,7 +146,7 @@ Repeated rendering of the same membership in masthead and body modules is collap
 
 Presence is explicit. Absence is inferred.
 
-- An asset-observation row means the asset was observed in the overall catalog.
+- An asset-observation row means the asset was observed in the applicable show catalog.
 - A membership-observation row means the asset was observed in a specific collection.
 - A missing row may be interpreted as absence only when the associated run is marked successful and complete.
 - A failed or incomplete run provides no evidence of absence.
@@ -159,7 +181,7 @@ These fields describe source assertions. They do not define the validity of ever
 
 ### 3.10 Complete catalog
 
-A run is **catalog complete** only when the ingestion process has evidence that all expected catalog content was retrieved and parsed.
+A run is **catalog complete for its configured show** only when the ingestion process has evidence that all expected show-catalog content was retrieved and parsed.
 
 For the current HTML-based source, completeness requires at minimum:
 
@@ -174,17 +196,17 @@ For the current HTML-based source, completeness requires at minimum:
 
 ## 4. Assumptions
 
-1. The PBS KIDS catalog HTML contains a Next.js `__NEXT_DATA__` payload that represents the catalog state returned for that request.
-2. Asset GUIDs observed in catalog entries correspond to the Media Manager asset IDs presented on watch pages.
+1. Each supported PBS KIDS show catalog HTML contains, or is expected to contain, a Next.js `__NEXT_DATA__` payload that represents the catalog state returned for that request.
+2. Asset GUIDs observed in catalog entries are assumed to correspond to the Media Manager asset IDs presented on watch pages across supported PBS KIDS shows. This assumption must be validated when each show is onboarded.
 3. PBS KIDS CMS IDs are unique within the PBS KIDS source namespace.
 4. Legacy TP media IDs are useful alternate identifiers, but uniqueness will not be enforced until empirical validation is complete.
-5. The catalog is small enough to store a full normalized observation for every asset on every run.
-6. Collection rotation is expected, so an asset may have multiple observed-presence periods and multiple observed-absence periods.
+5. The combined catalog for the supported shows is expected to remain small enough to store a full normalized observation for every show, asset, collection, and membership on every applicable run.
+6. Collection rotation is expected within each show, so an asset may have multiple observed-presence periods and multiple observed-absence periods in one or more show collections.
 7. A single catalog run uses one UTC `observed_at` value for all rows inserted by that run.
 8. Raw response files may be retained outside SQLite; SQLite stores their hashes and optional relative paths.
 9. SQLite foreign-key enforcement will be enabled for every connection.
 10. The initial process has one writer. Concurrent read access is permitted through WAL mode.
-11. Phase 1 records catalog metadata only. Phase 2 may add watch-page, availability, media-profile, caption, and download observations.
+11. Phase 1 records show and catalog metadata only. Phase 2 may add watch-page, availability, media-profile, caption, and download observations.
 
 ---
 
@@ -193,7 +215,7 @@ For the current HTML-based source, completeness requires at minimum:
 ### 5.1 Logical data flow
 
 ```text
-PBS KIDS catalog URL
+Configured PBS KIDS show catalog URLs
         |
         v
 HTTP retrieval
@@ -205,7 +227,7 @@ Raw HTML hash and optional snapshot
 Extract Next.js __NEXT_DATA__
         |
         v
-Normalize assets, collections, and memberships
+Normalize shows, assets, collections, and memberships
         |
         v
 Resolve stable identities and detect conflicts
@@ -214,7 +236,7 @@ Resolve stable identities and detect conflicts
 Single SQLite transaction
         |
         +--> catalog_run
-        +--> asset / collection registries
+        +--> show / show / asset / collection registries
         +--> asset_observation
         +--> collection_observation
         +--> membership_observation
@@ -244,6 +266,37 @@ Hashes are calculated from canonical normalized fields, not raw JSON object orde
 
 All registry and observation rows for one successful parse are committed in one transaction. A partially committed catalog state is not allowed.
 
+### 5.3 Multi-show run scope
+
+Each `catalog_run` is scoped to exactly one `show_id`. A scheduler may execute a batch containing several show runs, but completeness, presence, absence, and rotation are evaluated separately for each show.
+
+This prevents a failed Sesame Street retrieval from affecting Odd Squad observations and prevents a combined partial response from being treated as a complete multi-show snapshot.
+
+Recommended configuration fields per show:
+
+```text
+canonical_key
+catalog_url
+enabled
+expected_minimum_assets
+required_collection_slugs
+retrieval_frequency
+```
+
+A future optional `harvest_batch` table may group runs started by the same scheduler invocation. It must not replace show-scoped completeness.
+
+### 5.4 Asset-to-show relationship
+
+The design does not store `show_id` directly on `asset`. Instead, it records an `asset_show_observation` for each run in which an asset is associated with a show.
+
+This supports three cases without changing asset identity:
+
+1. the normal case in which one asset belongs to one show;
+2. a cross-program special returned by more than one show catalog;
+3. a corrected or changed PBS association.
+
+The Media Manager GUID remains globally unique when present. The same asset observed under two shows resolves to one `asset` row and two show-scoped observations.
+
 ### 5.3 Identity strategy
 
 SQLite assigns an internal integer `asset_id`. External identifiers are alternate identities used for reconciliation.
@@ -258,7 +311,7 @@ Resolution order:
 6. Attach a previously unknown alternate identifier only after uniqueness checks.
 7. Record a conflict and reject automatic merging when identifiers point to different assets.
 
-The Media Manager GUID is the strongest current external identity because it is associated with the underlying Media Manager asset. It is not the SQLite primary key.
+The Media Manager GUID is the strongest current external asset identity because it is associated with the underlying Media Manager asset. It is not the SQLite primary key. Show identity is resolved separately from asset identity, and an asset-to-show relationship is observed rather than embedded permanently in the asset registry.
 
 ### 5.4 Temporal model
 
@@ -295,12 +348,119 @@ This evidence supports replay, debugging, and parser validation.
 ### 6.1 Relationship summary
 
 ```text
+show        1 --- * show_observation
+catalog_run 1 --- * show_observation
 catalog_run 1 --- * asset_observation * --- 1 asset
+show        1 --- * asset_show_observation * --- 1 asset
 catalog_run 1 --- * collection_observation * --- 1 collection
 catalog_run 1 --- * membership_observation * --- 1 asset
+show        1 --- * collection
 collection  1 --- * membership_observation
 catalog_run 1 --- * identity_conflict
 ```
+
+### 6.2 `show`
+
+Stores governed show identity and retrieval configuration.
+
+```sql
+CREATE TABLE show
+(
+    show_id                   INTEGER PRIMARY KEY,
+    canonical_key             TEXT NOT NULL UNIQUE,
+    catalog_url               TEXT NOT NULL UNIQUE,
+    enabled                   INTEGER NOT NULL DEFAULT 1
+        CHECK (enabled IN (0, 1)),
+    expected_minimum_assets   INTEGER
+        CHECK (expected_minimum_assets IS NULL OR expected_minimum_assets >= 0),
+    retrieval_frequency       TEXT,
+    created_at                TEXT NOT NULL DEFAULT
+        (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+```
+
+Example seed data:
+
+```sql
+INSERT INTO show(canonical_key, catalog_url, expected_minimum_assets)
+VALUES
+    ('odd-squad', 'https://pbskids.org/videos/odd-squad', 1),
+    ('sesame-street', 'https://pbskids.org/videos/sesame-street', 1),
+    ('daniel-tiger', 'https://pbskids.org/videos/daniel-tigers-neighborhood', 1),
+    ('wild-kratts', 'https://pbskids.org/videos/wild-kratts', 1),
+    ('curious-george', 'https://pbskids.org/videos/curious-george', 1);
+```
+
+The example URLs are configuration examples and must be verified during onboarding before production use.
+
+Show-specific required collections should be normalized rather than stored as delimited text:
+
+```sql
+CREATE TABLE show_required_collection
+(
+    show_id          INTEGER NOT NULL,
+    collection_slug  TEXT NOT NULL,
+
+    PRIMARY KEY (show_id, collection_slug),
+
+    FOREIGN KEY (show_id)
+        REFERENCES show(show_id)
+) WITHOUT ROWID;
+```
+
+
+### 6.3 `show_observation`
+
+Stores mutable show attributes returned in a run.
+
+```sql
+CREATE TABLE show_observation
+(
+    run_id          INTEGER NOT NULL,
+    show_id         INTEGER NOT NULL,
+    source_slug     TEXT,
+    source_title    TEXT NOT NULL,
+    nola_root       TEXT,
+    metadata_hash   TEXT NOT NULL,
+
+    PRIMARY KEY (run_id, show_id),
+
+    FOREIGN KEY (run_id)
+        REFERENCES catalog_run(run_id),
+
+    FOREIGN KEY (show_id)
+        REFERENCES show(show_id)
+) WITHOUT ROWID;
+```
+
+### 6.4 `asset_show_observation`
+
+Records the show association asserted by a catalog run.
+
+```sql
+CREATE TABLE asset_show_observation
+(
+    run_id      INTEGER NOT NULL,
+    show_id     INTEGER NOT NULL,
+    asset_id    INTEGER NOT NULL,
+
+    PRIMARY KEY (run_id, show_id, asset_id),
+
+    FOREIGN KEY (run_id)
+        REFERENCES catalog_run(run_id),
+
+    FOREIGN KEY (show_id)
+        REFERENCES show(show_id),
+
+    FOREIGN KEY (asset_id)
+        REFERENCES asset(asset_id)
+) WITHOUT ROWID;
+
+CREATE INDEX ix_asset_show_observation_asset_run
+ON asset_show_observation(asset_id, run_id);
+```
+
+The ingestion process inserts one row for every observed asset in the run. The table permits the same asset to be associated with multiple shows across runs without duplicating the asset registry row.
 
 ### 6.2 `catalog_run`
 
@@ -311,6 +471,7 @@ CREATE TABLE catalog_run
 (
     run_id                   INTEGER PRIMARY KEY,
     observed_at              TEXT NOT NULL,
+    show_id                  INTEGER NOT NULL,
     source_url               TEXT NOT NULL,
     http_status              INTEGER,
     response_sha256          TEXT,
@@ -329,6 +490,9 @@ CREATE TABLE catalog_run
     created_at               TEXT NOT NULL DEFAULT
         (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 
+    FOREIGN KEY (show_id)
+        REFERENCES show(show_id),
+
     CHECK
     (
         catalog_complete = 0
@@ -337,17 +501,20 @@ CREATE TABLE catalog_run
 );
 ```
 
-Recommended additional rule in ingestion code: only one successful run may be loaded for a given `source_url`, `observed_at`, and `response_sha256` combination.
+Recommended additional rule in ingestion code: only one successful run may be loaded for a given `show_id`, `source_url`, `observed_at`, and `response_sha256` combination.
 
 ```sql
 CREATE UNIQUE INDEX ux_catalog_run_source_observation_response
-ON catalog_run(source_url, observed_at, response_sha256)
+ON catalog_run(show_id, source_url, observed_at, response_sha256)
 WHERE response_sha256 IS NOT NULL;
+
+CREATE INDEX ix_catalog_run_show_observed
+ON catalog_run(show_id, observed_at, run_id);
 ```
 
 ### 6.3 `asset`
 
-Stores stable reconciliation identities only.
+Stores stable reconciliation identities only. Show association is intentionally excluded because it is represented by run-scoped asset-to-show observations.
 
 ```sql
 CREATE TABLE asset
@@ -392,8 +559,6 @@ CREATE TABLE asset_observation
     slug                   TEXT NOT NULL,
     title                  TEXT NOT NULL,
     video_type             TEXT NOT NULL,
-    show_slug              TEXT,
-    show_title             TEXT,
     description_short      TEXT,
     duration_seconds       INTEGER,
     source_premiered_at    TEXT,
@@ -424,8 +589,6 @@ Recommended canonical metadata-hash input:
   "slug": "best-seats-in-the-house-agent-obfusco",
   "title": "Best Seats in the House/Agent Obfusco",
   "video_type": "fullEpisode",
-  "show_slug": "odd-squad",
-  "show_title": "Odd Squad",
   "description_short": "...",
   "duration_seconds": 1571,
   "source_premiered_at": "2014-12-09T00:00:00Z"
@@ -434,13 +597,19 @@ Recommended canonical metadata-hash input:
 
 ### 6.5 `collection`
 
-Stores stable PBS collection identity.
+Stores stable PBS collection identity and its owning show. Collection IDs are expected to be globally unique, while the explicit show foreign key enforces ownership and supports show-scoped queries.
 
 ```sql
 CREATE TABLE collection
 (
     collection_id       INTEGER PRIMARY KEY,
-    pbs_collection_id   TEXT NOT NULL UNIQUE
+    show_id             INTEGER NOT NULL,
+    pbs_collection_id   TEXT NOT NULL UNIQUE,
+
+    FOREIGN KEY (show_id)
+        REFERENCES show(show_id),
+
+    UNIQUE (show_id, pbs_collection_id)
 );
 ```
 
@@ -564,32 +733,37 @@ Automatic ingestion shall not merge assets when populated identifiers resolve to
 ### 7.1 Latest complete run
 
 ```sql
-CREATE VIEW latest_complete_catalog_run AS
-SELECT *
-FROM catalog_run
-WHERE run_id =
+CREATE VIEW latest_complete_catalog_run_by_show AS
+WITH ranked AS
 (
-    SELECT run_id
-    FROM catalog_run
+    SELECT
+        cr.*,
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY show_id
+            ORDER BY observed_at DESC, run_id DESC
+        ) AS row_number
+    FROM catalog_run AS cr
     WHERE retrieval_succeeded = 1
       AND parse_succeeded = 1
       AND catalog_complete = 1
-    ORDER BY observed_at DESC, run_id DESC
-    LIMIT 1
-);
+)
+SELECT *
+FROM ranked
+WHERE row_number = 1;
 ```
 
 ### 7.2 Current observed catalog
 
 ```sql
-CREATE VIEW current_catalog AS
+CREATE VIEW current_catalog_by_show AS
 SELECT
     ao.*,
     a.media_manager_guid,
     a.pbs_kids_cms_id,
     a.legacy_tp_media_id,
     cr.observed_at
-FROM latest_complete_catalog_run AS cr
+FROM latest_complete_catalog_run_by_show AS cr
 JOIN asset_observation AS ao
   ON ao.run_id = cr.run_id
 JOIN asset AS a
@@ -650,10 +824,12 @@ The following query derives islands of consecutive complete runs in which an ass
 WITH complete_runs AS
 (
     SELECT
+        show_id,
         run_id,
         observed_at,
         ROW_NUMBER() OVER
         (
+            PARTITION BY show_id
             ORDER BY observed_at, run_id
         ) AS run_sequence
     FROM catalog_run
@@ -664,6 +840,7 @@ WITH complete_runs AS
 present_memberships AS
 (
     SELECT
+        cr.show_id,
         mo.collection_id,
         mo.asset_id,
         cr.run_id,
@@ -671,7 +848,7 @@ present_memberships AS
         cr.run_sequence,
         ROW_NUMBER() OVER
         (
-            PARTITION BY mo.collection_id, mo.asset_id
+            PARTITION BY cr.show_id, mo.collection_id, mo.asset_id
             ORDER BY cr.run_sequence
         ) AS present_sequence
     FROM membership_observation AS mo
@@ -681,6 +858,7 @@ present_memberships AS
 islands AS
 (
     SELECT
+        show_id,
         collection_id,
         asset_id,
         run_id,
@@ -689,13 +867,14 @@ islands AS
     FROM present_memberships
 )
 SELECT
+    show_id,
     collection_id,
     asset_id,
     MIN(observed_at) AS first_observed_present_at,
     MAX(observed_at) AS last_observed_present_at,
     COUNT(*) AS present_observation_count
 FROM islands
-GROUP BY collection_id, asset_id, island_id;
+GROUP BY show_id, collection_id, asset_id, island_id;
 ```
 
 These rows are observation periods, not exact PBS availability intervals.
@@ -785,12 +964,12 @@ Compute SHA-256 over UTF-8 bytes.
 The parser shall determine completeness before absence is inferred. Store `catalog_complete = 0` when:
 
 - expected Next.js page data is missing;
-- expected collections are absent without an approved source change;
+- show-specific required collections are absent without an approved source change;
 - a schema-breaking parser warning occurs;
 - pagination or dependent resources are known to be incomplete;
-- retrieved asset count falls below a configurable anomaly threshold pending review.
+- retrieved asset count falls below a show-specific configurable anomaly threshold pending review.
 
-An unexpectedly low count should normally block completeness rather than delete historical membership through inference.
+An unexpectedly low count relative to that show's validation profile should normally block completeness rather than delete historical membership through inference.
 
 ### 8.6 Identifier reconciliation
 
@@ -819,7 +998,7 @@ Recommended directory structure:
 
 ```text
 data/
-  catalog.sqlite3
+  pbs-kids-catalog.sqlite3
   snapshots/
     2026/
       10/
@@ -865,13 +1044,13 @@ Migration requirements:
 
 ### 9.1 Scheduled catalog run
 
-Recommended initial frequency: daily. Increase only if rotation analysis demonstrates a business need.
+Recommended initial frequency: daily per enabled show. Increase only if rotation analysis demonstrates a business need.
 
 Procedure:
 
 1. Open SQLite with required PRAGMAs.
 2. Begin a run and establish one UTC observation timestamp.
-3. Retrieve the catalog with timeouts and bounded retries.
+3. Retrieve each enabled show catalog with timeouts and bounded retries.
 4. Save and hash the response.
 5. Parse and normalize the catalog.
 6. Apply completeness checks.
@@ -879,6 +1058,29 @@ Procedure:
 8. Execute post-load validation.
 9. Emit structured run metrics.
 10. Back up according to policy.
+
+### 9.2 Show onboarding
+
+Before enabling a new show:
+
+1. Verify the production catalog URL manually.
+2. Save a representative raw HTML fixture.
+3. Confirm the `__NEXT_DATA__` path and collection structure.
+4. Verify identifier behavior across catalog and watch pages.
+5. Record baseline counts by video type and collection.
+6. Configure a conservative minimum-asset threshold.
+7. Configure required collections only when their continued presence is a reliable structural expectation.
+8. Add fixture tests for the show.
+9. Execute at least two non-production runs and compare deterministic hashes.
+10. Enable the show for scheduled retrieval.
+
+Do not copy Odd Squad count thresholds or collection rules to another show without evidence. Each show may use different collection names, content types, and catalog organization.
+
+### 9.3 Batch operations
+
+A scheduler may process all enabled shows in one invocation. Each show run remains an independent transaction and receives its own status.
+
+A failure for one show shall not roll back successful runs for other shows. The scheduler summary shall report results by `show_id` and canonical key.
 
 ### 9.2 Failure handling
 
@@ -1012,9 +1214,44 @@ Expected result for `integrity_check`:
 ok
 ```
 
+### 10.2 Multi-show isolation validation
+
+Create successful complete runs for at least two shows with overlapping observation times.
+
+Validate that:
+
+- latest-state queries return one latest complete run per show;
+- absence is compared only between consecutive complete runs for the same show;
+- collection rotation is grouped by owning show and collection;
+- failure of one show does not affect completeness for another show;
+- the same Media Manager GUID, if observed in two shows, resolves to one asset and two asset-to-show observations.
+
+The original single-row `latest_complete_catalog_run` view shall be replaced by a per-show view:
+
+```sql
+CREATE VIEW latest_complete_catalog_run_by_show AS
+WITH ranked AS
+(
+    SELECT
+        cr.*,
+        ROW_NUMBER() OVER
+        (
+            PARTITION BY show_id
+            ORDER BY observed_at DESC, run_id DESC
+        ) AS row_number
+    FROM catalog_run AS cr
+    WHERE retrieval_succeeded = 1
+      AND parse_succeeded = 1
+      AND catalog_complete = 1
+)
+SELECT *
+FROM ranked
+WHERE row_number = 1;
+```
+
 ### 10.2 Fixture validation
 
-The supplied catalog fixture currently yields:
+The supplied Odd Squad catalog fixture currently yields:
 
 - 94 video occurrences before deduplication;
 - 86 unique assets;
@@ -1335,7 +1572,7 @@ Recovery procedure:
 
 ### A.2 Internal primary key
 
-**Decision:** Use SQLite `INTEGER PRIMARY KEY` for assets and collections.
+**Decision:** Use SQLite `INTEGER PRIMARY KEY` for shows, assets, and collections.
 
 **Reason:** External identifiers belong to PBS source systems and should not be propagated as relational foreign keys.
 
@@ -1357,13 +1594,19 @@ Recovery procedure:
 
 **Reason:** PBS is expected to rotate episodes. A single first-present or first-absent pair cannot represent recurring membership.
 
-### A.6 Page placement
+### A.6 Show scope
+
+**Decision:** Scope every catalog run to exactly one show and model asset-to-show association as an observation.
+
+**Reason:** Completeness and absence must be evaluated independently per show, while a shared asset registry prevents duplicate underlying media assets.
+
+### A.7 Page placement
 
 **Decision:** Do not store page placement.
 
 **Reason:** Masthead versus body rendering is not required for catalog, analytics, or download decisions. Duplicate renderings collapse to one membership observation.
 
-### A.7 Full observation storage
+### A.8 Full observation storage
 
 **Decision:** Store one normalized observation per asset per complete run.
 
