@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import errno
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -136,6 +138,47 @@ def sha256_file(path: Path) -> str:
             digest.update(block)
     return digest.hexdigest()
 
+
+
+def promote_download(temporary: Path, destination: Path) -> None:
+    """Install a completed download, including across filesystems.
+
+    An atomic rename is used when staging and destination are on the same
+    filesystem. If they are on different filesystems, the file is copied to a
+    temporary sibling of the destination, flushed, and atomically renamed
+    there before the staging file is removed.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        os.replace(temporary, destination)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+
+    destination_temporary = destination.with_name(
+        f".{destination.name}.installing-{os.getpid()}"
+    )
+    destination_temporary.unlink(missing_ok=True)
+
+    try:
+        with temporary.open("rb") as source:
+            with destination_temporary.open("xb") as target:
+                shutil.copyfileobj(source, target, length=1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+
+        shutil.copystat(
+            temporary,
+            destination_temporary,
+            follow_symlinks=True,
+        )
+        os.replace(destination_temporary, destination)
+        temporary.unlink()
+    except Exception:
+        destination_temporary.unlink(missing_ok=True)
+        raise
 
 def verify_file(
     path: Path,
@@ -533,7 +576,7 @@ def download_candidate(
             "error": error,
         }
 
-    temporary.replace(destination)
+    promote_download(temporary, destination)
     verification = verify_file(
         destination,
         parsed.duration_seconds or row["duration_seconds"],
