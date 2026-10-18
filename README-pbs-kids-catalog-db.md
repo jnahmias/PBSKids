@@ -96,3 +96,53 @@ Relative database and snapshot paths are resolved relative to the INI file.
 ```bash
 python -m unittest -v test_pbs_kids_catalog_onboarding.py
 ```
+
+## Updating all enabled shows
+
+`update-all` processes every enabled show in canonical-key order. Each show uses an independent database transaction. A retrieval or parser failure for one show is recorded as an incomplete run and does not prevent later shows from running.
+
+```bash
+python pbs_kids_catalog_db.py update-all
+```
+
+Limit execution to selected enabled shows by repeating `--only`:
+
+```bash
+python pbs_kids_catalog_db.py update-all \
+  --only odd-squad \
+  --only wild-kratts
+```
+
+Exclude one or more enabled shows:
+
+```bash
+python pbs_kids_catalog_db.py update-all \
+  --exclude sesame-street
+```
+
+`--only` is evaluated first, followed by `--exclude`. Disabled shows are never selected. Requesting an unknown or disabled show with `--only` is an error.
+
+Structured execution summaries are available for scheduled processing:
+
+```bash
+python pbs_kids_catalog_db.py update-all \
+  --output-format json
+```
+
+The command exits with:
+
+- `0` when every selected show was retrieved, parsed, and marked complete;
+- `1` when one or more selected shows failed or were marked incomplete;
+- `2` for configuration errors, invalid selections, or other command-level failures.
+
+The existing `update` command applies the same ingestion and completeness logic to one enabled show:
+
+```bash
+python pbs_kids_catalog_db.py update odd-squad
+```
+
+Run the update-all tests with:
+
+```bash
+python -m unittest -v test_pbs_kids_catalog_update_all.py
+```

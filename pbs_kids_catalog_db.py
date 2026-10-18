@@ -385,6 +385,470 @@ def onboard_show(
     return show_id
 
 
+
+def save_snapshot(
+    snapshot_root: Path | None,
+    show_key: str,
+    observed_at: str,
+    html: str,
+) -> str | None:
+    """Save a compressed catalog response and return its relative path."""
+    if snapshot_root is None:
+        return None
+
+    timestamp = datetime.fromisoformat(observed_at.replace("Z", "+00:00"))
+    relative_path = Path(
+        f"{timestamp:%Y/%m}/{timestamp:%Y%m%dT%H%M%S}-{show_key}.html.gz"
+    )
+    target = snapshot_root / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    with gzip.open(temporary, "wt", encoding="utf-8") as handle:
+        handle.write(html)
+    temporary.replace(target)
+    return relative_path.as_posix()
+
+
+def resolve_asset(
+    connection: sqlite3.Connection,
+    video: catalog_parser.CatalogVideo,
+) -> int:
+    """Resolve an asset by known identifiers or create a stable identity row."""
+    identifiers = (
+        ("media_manager_guid", video.media_manager_guid),
+        ("pbs_kids_cms_id", video.cms_id),
+        ("legacy_tp_media_id", video.legacy_tp_media_id),
+    )
+    matches: set[int] = set()
+
+    for column, value in identifiers:
+        if value:
+            rows = connection.execute(
+                f"SELECT asset_id FROM asset WHERE {column} = ?",
+                (value,),
+            ).fetchall()
+            matches.update(int(row[0]) for row in rows)
+
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Conflicting identifiers for asset {video.media_manager_guid}: "
+            f"matched asset IDs {sorted(matches)}."
+        )
+
+    if matches:
+        return next(iter(matches))
+
+    cursor = connection.execute(
+        """
+        INSERT INTO asset
+            (media_manager_guid, pbs_kids_cms_id, legacy_tp_media_id)
+        VALUES
+            (?, ?, ?)
+        """,
+        (
+            video.media_manager_guid,
+            video.cms_id,
+            video.legacy_tp_media_id,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def ingest_catalog_run(
+    connection: sqlite3.Connection,
+    show: sqlite3.Row,
+    parsed: catalog_parser.ParsedCatalog,
+    response: dict[str, Any],
+    html: str,
+    observed_at: str,
+    snapshot_relative_path: str | None,
+) -> dict[str, Any]:
+    """Insert one append-only catalog observation for one show."""
+    response_hash = hashlib.sha256(html.encode("utf-8")).hexdigest()
+
+    with connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO catalog_run
+                (show_id, observed_at, source_url, http_status,
+                 response_sha256, response_etag, response_last_modified,
+                 snapshot_relative_path, next_build_id, parser_version,
+                 retrieval_succeeded, parse_succeeded, catalog_complete)
+            VALUES
+                (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 0)
+            """,
+            (
+                show["show_id"],
+                observed_at,
+                show["catalog_url"],
+                response.get("status"),
+                response_hash,
+                response.get("etag"),
+                response.get("last_modified"),
+                snapshot_relative_path,
+                parsed.metadata.build_id,
+                APP_VERSION,
+            ),
+        )
+        run_id = int(cursor.lastrowid)
+
+        show_metadata = {
+            "source_slug": parsed.metadata.page_slug,
+            "source_title": parsed.metadata.page_title,
+        }
+        connection.execute(
+            """
+            INSERT INTO show_observation
+                (run_id, show_id, source_slug, source_title, metadata_hash)
+            VALUES
+                (?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                show["show_id"],
+                parsed.metadata.page_slug,
+                parsed.metadata.page_title or show["canonical_key"],
+                canonical_hash(show_metadata),
+            ),
+        )
+
+        collection_ids: dict[str, int] = {}
+        collection_by_source_id = {
+            item.pbs_collection_id: item for item in parsed.collections
+        }
+        for summary in parsed.collections:
+            row = connection.execute(
+                """
+                SELECT collection_id, show_id
+                FROM collection
+                WHERE pbs_collection_id = ?
+                """,
+                (summary.pbs_collection_id,),
+            ).fetchone()
+            if row and int(row["show_id"]) != int(show["show_id"]):
+                raise RuntimeError(
+                    f"Collection {summary.pbs_collection_id} belongs to another show."
+                )
+            if row:
+                collection_id = int(row["collection_id"])
+            else:
+                collection_id = int(
+                    connection.execute(
+                        """
+                        INSERT INTO collection
+                            (show_id, pbs_collection_id)
+                        VALUES
+                            (?, ?)
+                        """,
+                        (show["show_id"], summary.pbs_collection_id),
+                    ).lastrowid
+                )
+            collection_ids[summary.pbs_collection_id] = collection_id
+            collection_metadata = {
+                "slug": summary.slug,
+                "title": summary.title,
+                "heading": summary.heading,
+            }
+            connection.execute(
+                """
+                INSERT INTO collection_observation
+                    (run_id, collection_id, slug, title, heading, metadata_hash)
+                VALUES
+                    (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    collection_id,
+                    summary.slug,
+                    summary.title,
+                    summary.heading,
+                    canonical_hash(collection_metadata),
+                ),
+            )
+
+        membership_count = 0
+        for video in parsed.videos:
+            asset_id = resolve_asset(connection, video)
+            asset_metadata = {
+                "slug": video.slug,
+                "title": video.title,
+                "video_type": video.video_type,
+                "description_short": video.description_short,
+                "duration_seconds": video.duration_seconds,
+                "source_premiered_at": video.premiered_on_utc,
+            }
+            connection.execute(
+                """
+                INSERT INTO asset_observation
+                    (run_id, asset_id, slug, title, video_type,
+                     description_short, duration_seconds,
+                     source_premiered_at, metadata_hash)
+                VALUES
+                    (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    asset_id,
+                    video.slug,
+                    video.title,
+                    video.video_type,
+                    video.description_short,
+                    video.duration_seconds,
+                    video.premiered_on_utc,
+                    canonical_hash(asset_metadata),
+                ),
+            )
+
+            seen_collections: set[str] = set()
+            for membership in video.memberships:
+                if membership.pbs_collection_id in seen_collections:
+                    continue
+                seen_collections.add(membership.pbs_collection_id)
+                connection.execute(
+                    """
+                    INSERT INTO membership_observation
+                        (run_id, collection_id, asset_id,
+                         ordinal_position, watch_url)
+                    VALUES
+                        (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        collection_ids[membership.pbs_collection_id],
+                        asset_id,
+                        membership.ordinal_position,
+                        membership.watch_url,
+                    ),
+                )
+                membership_count += 1
+
+        required = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT collection_slug
+                FROM show_required_collection
+                WHERE show_id = ?
+                """,
+                (show["show_id"],),
+            )
+        }
+        observed_collection_slugs = {
+            item.slug for item in collection_by_source_id.values()
+        }
+        minimum = show["expected_minimum_assets"]
+        complete = parsed.metadata.unique_asset_count > 0
+        errors: list[str] = []
+
+        if minimum is not None and parsed.metadata.unique_asset_count < int(minimum):
+            complete = False
+            errors.append(
+                f"asset count {parsed.metadata.unique_asset_count} below minimum {minimum}"
+            )
+        missing_collections = sorted(required - observed_collection_slugs)
+        if missing_collections:
+            complete = False
+            errors.append(
+                "missing required collections: " + ", ".join(missing_collections)
+            )
+
+        connection.execute(
+            """
+            UPDATE catalog_run
+            SET catalog_complete = ?, error_message = ?
+            WHERE run_id = ?
+            """,
+            (int(complete), "; ".join(errors) or None, run_id),
+        )
+
+    return {
+        "show": show["canonical_key"],
+        "run_id": run_id,
+        "success": True,
+        "catalog_complete": complete,
+        "assets": parsed.metadata.unique_asset_count,
+        "collections": len(parsed.collections),
+        "memberships": membership_count,
+        "error": "; ".join(errors) or None,
+    }
+
+
+def record_failed_run(
+    connection: sqlite3.Connection,
+    show: sqlite3.Row,
+    observed_at: str,
+    error: str,
+) -> int:
+    """Record a retrieval or parse failure without inferring absence."""
+    with connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO catalog_run
+                (show_id, observed_at, source_url, parser_version,
+                 retrieval_succeeded, parse_succeeded,
+                 catalog_complete, error_message)
+            VALUES
+                (?, ?, ?, ?, 0, 0, 0, ?)
+            """,
+            (
+                show["show_id"],
+                observed_at,
+                show["catalog_url"],
+                APP_VERSION,
+                error,
+            ),
+        )
+    return int(cursor.lastrowid)
+
+
+def update_one_show(
+    database: Path,
+    settings: Settings,
+    show_key: str,
+    snapshot_root: Path | None,
+    observed_at: str | None = None,
+) -> dict[str, Any]:
+    """Retrieve and ingest one configured, enabled show."""
+    timestamp = observed_at or utc_now()
+    with connect(database, settings) as connection:
+        show = find_show(connection, show_key)
+        if not show["enabled"]:
+            raise ValueError(f"Show {show_key!r} is disabled.")
+
+        try:
+            html, response = fetch_catalog(show["catalog_url"], settings)
+            parsed = catalog_parser.parse_catalog_html(
+                html,
+                response["final_url"],
+            )
+            snapshot_path = save_snapshot(
+                snapshot_root,
+                show_key,
+                timestamp,
+                html,
+            )
+            return ingest_catalog_run(
+                connection,
+                show,
+                parsed,
+                response,
+                html,
+                timestamp,
+                snapshot_path,
+            )
+        except Exception as exc:
+            run_id = record_failed_run(connection, show, timestamp, str(exc))
+            return {
+                "show": show_key,
+                "run_id": run_id,
+                "success": False,
+                "catalog_complete": False,
+                "assets": 0,
+                "collections": 0,
+                "memberships": 0,
+                "error": str(exc),
+            }
+
+
+def update_all_shows(
+    database: Path,
+    settings: Settings,
+    snapshot_root: Path | None,
+    only: set[str] | None = None,
+    exclude: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Update all selected enabled shows, continuing after individual failures."""
+    with connect(database, settings) as connection:
+        rows = connection.execute(
+            """
+            SELECT canonical_key
+            FROM show
+            WHERE enabled = 1
+            ORDER BY canonical_key
+            """
+        ).fetchall()
+
+    configured = {str(row["canonical_key"]) for row in rows}
+    selected = configured
+    if only:
+        unknown = sorted(only - configured)
+        if unknown:
+            raise ValueError(
+                "The following requested shows are not enabled or configured: "
+                + ", ".join(unknown)
+            )
+        selected = selected & only
+    if exclude:
+        selected = selected - exclude
+
+    if not selected:
+        raise ValueError("No enabled shows were selected for update.")
+
+    results: list[dict[str, Any]] = []
+    for show_key in sorted(selected):
+        LOG.info("Updating show=%s", show_key)
+        result = update_one_show(
+            database,
+            settings,
+            show_key,
+            snapshot_root,
+        )
+        results.append(result)
+        if result["success"]:
+            LOG.info(
+                "Updated show=%s run_id=%s assets=%s complete=%s",
+                show_key,
+                result["run_id"],
+                result["assets"],
+                result["catalog_complete"],
+            )
+        else:
+            LOG.error(
+                "Update failed show=%s run_id=%s error=%s",
+                show_key,
+                result["run_id"],
+                result["error"],
+            )
+    return results
+
+
+def print_update_summary(
+    results: list[dict[str, Any]],
+    output_format: str,
+) -> None:
+    """Print a human-readable or JSON update-all summary."""
+    summary = {
+        "shows_attempted": len(results),
+        "shows_succeeded": sum(bool(row["success"]) for row in results),
+        "shows_failed": sum(not bool(row["success"]) for row in results),
+        "shows_complete": sum(bool(row["catalog_complete"]) for row in results),
+        "results": results,
+    }
+
+    if output_format == "json":
+        print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
+        return
+
+    print(
+        "Update summary: "
+        f"attempted={summary['shows_attempted']} "
+        f"succeeded={summary['shows_succeeded']} "
+        f"failed={summary['shows_failed']} "
+        f"complete={summary['shows_complete']}"
+    )
+    for result in results:
+        status = "COMPLETE" if result["catalog_complete"] else "FAILED"
+        if result["success"] and not result["catalog_complete"]:
+            status = "INCOMPLETE"
+        line = (
+            f"  {result['show']}: {status}; "
+            f"run_id={result['run_id']}; assets={result['assets']}"
+        )
+        if result["error"]:
+            line += f"; {result['error']}"
+        print(line)
+
 def build_cli(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Maintain and discover PBS KIDS catalog pages."
@@ -425,6 +889,25 @@ def build_cli(argv: Sequence[str]) -> argparse.Namespace:
     onboard.add_argument("--enable", action="store_true")
     onboard.add_argument("--replace", action="store_true")
     onboard.add_argument("--output-format", choices=("text", "json"), default="text")
+
+    update = subparsers.add_parser(
+        "update",
+        help="Retrieve and ingest one enabled show.",
+    )
+    update.add_argument("key")
+    update.add_argument("--output-format", choices=("text", "json"), default="text")
+
+    update_all = subparsers.add_parser(
+        "update-all",
+        help="Update all selected enabled shows and continue after individual failures.",
+    )
+    update_all.add_argument("--only", action="append", default=[])
+    update_all.add_argument("--exclude", action="append", default=[])
+    update_all.add_argument(
+        "--output-format",
+        choices=("text", "json"),
+        default="text",
+    )
 
     require_collection = subparsers.add_parser("require-collection")
     require_collection.add_argument("key")
@@ -473,6 +956,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                 state = "enabled" if args.enable else "disabled"
                 print(f"Saved show_id={show_id}; state={state}.")
             return 0
+
+        if args.command == "update":
+            result = update_one_show(
+                database,
+                settings,
+                args.key,
+                args.snapshot_root.expanduser()
+                if args.snapshot_root
+                else settings.snapshot_root,
+            )
+            print_update_summary([result], args.output_format)
+            return 0 if result["success"] and result["catalog_complete"] else 1
+
+        if args.command == "update-all":
+            results = update_all_shows(
+                database=database,
+                settings=settings,
+                snapshot_root=(
+                    args.snapshot_root.expanduser()
+                    if args.snapshot_root
+                    else settings.snapshot_root
+                ),
+                only=set(args.only) or None,
+                exclude=set(args.exclude) or None,
+            )
+            print_update_summary(results, args.output_format)
+            return 0 if all(
+                row["success"] and row["catalog_complete"] for row in results
+            ) else 1
 
         if args.command == "add-show":
             with connect(database, settings) as connection:
