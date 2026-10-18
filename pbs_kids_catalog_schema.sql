@@ -61,48 +61,16 @@ CREATE TABLE IF NOT EXISTS catalog_run
                              (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 
     FOREIGN KEY (show_id)
-        REFERENCES show(show_id),
-
-    CHECK
-    (
-        catalog_complete = 0
-        OR (retrieval_succeeded = 1 AND parse_succeeded = 1)
-    )
+        REFERENCES show(show_id)
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS ux_catalog_run
-ON catalog_run(show_id, source_url, observed_at, response_sha256)
-WHERE response_sha256 IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS ix_catalog_run_show_time
-ON catalog_run(show_id, observed_at, run_id);
 
 CREATE TABLE IF NOT EXISTS asset
 (
     asset_id             INTEGER PRIMARY KEY,
-    media_manager_guid   TEXT,
-    pbs_kids_cms_id      TEXT,
-    legacy_tp_media_id   TEXT,
-
-    CHECK
-    (
-        media_manager_guid IS NOT NULL
-        OR pbs_kids_cms_id IS NOT NULL
-        OR legacy_tp_media_id IS NOT NULL
-    )
+    media_manager_guid   TEXT UNIQUE,
+    pbs_kids_cms_id      TEXT UNIQUE,
+    legacy_tp_media_id   TEXT
 );
-
-CREATE UNIQUE INDEX IF NOT EXISTS ux_asset_media_manager_guid
-ON asset(media_manager_guid)
-WHERE media_manager_guid IS NOT NULL;
-
-CREATE UNIQUE INDEX IF NOT EXISTS ux_asset_pbs_kids_cms_id
-ON asset(pbs_kids_cms_id)
-WHERE pbs_kids_cms_id IS NOT NULL;
-
-CREATE INDEX IF NOT EXISTS ix_asset_legacy_tp_media_id
-ON asset(legacy_tp_media_id)
-WHERE legacy_tp_media_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS collection
 (
@@ -149,26 +117,6 @@ CREATE TABLE IF NOT EXISTS asset_observation
         REFERENCES catalog_run(run_id),
 
     FOREIGN KEY (asset_id)
-        REFERENCES asset(asset_id),
-
-    CHECK (duration_seconds IS NULL OR duration_seconds >= 0)
-) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS asset_show_observation
-(
-    run_id      INTEGER NOT NULL,
-    show_id     INTEGER NOT NULL,
-    asset_id    INTEGER NOT NULL,
-
-    PRIMARY KEY (run_id, show_id, asset_id),
-
-    FOREIGN KEY (run_id)
-        REFERENCES catalog_run(run_id),
-
-    FOREIGN KEY (show_id)
-        REFERENCES show(show_id),
-
-    FOREIGN KEY (asset_id)
         REFERENCES asset(asset_id)
 ) WITHOUT ROWID;
 
@@ -209,69 +157,3 @@ CREATE TABLE IF NOT EXISTS membership_observation
     FOREIGN KEY (asset_id)
         REFERENCES asset(asset_id)
 ) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS asset_image_observation
-(
-    run_id     INTEGER NOT NULL,
-    asset_id   INTEGER NOT NULL,
-    profile    TEXT NOT NULL,
-    image_url  TEXT NOT NULL,
-
-    PRIMARY KEY (run_id, asset_id, profile, image_url),
-
-    FOREIGN KEY (run_id)
-        REFERENCES catalog_run(run_id),
-
-    FOREIGN KEY (asset_id)
-        REFERENCES asset(asset_id)
-) WITHOUT ROWID;
-
-CREATE TABLE IF NOT EXISTS identity_conflict
-(
-    conflict_id          INTEGER PRIMARY KEY,
-    run_id               INTEGER NOT NULL,
-    media_manager_guid   TEXT,
-    pbs_kids_cms_id      TEXT,
-    legacy_tp_media_id   TEXT,
-    matched_asset_ids    TEXT NOT NULL,
-    source_record_json   TEXT NOT NULL,
-    detected_at          TEXT NOT NULL,
-    resolution_status    TEXT NOT NULL DEFAULT 'unresolved',
-    resolution_notes     TEXT,
-
-    FOREIGN KEY (run_id)
-        REFERENCES catalog_run(run_id)
-);
-
-CREATE VIEW IF NOT EXISTS latest_complete_catalog_run_by_show AS
-WITH ranked AS
-(
-    SELECT
-        cr.*,
-        ROW_NUMBER() OVER
-        (
-            PARTITION BY show_id
-            ORDER BY observed_at DESC, run_id DESC
-        ) AS row_number
-    FROM catalog_run AS cr
-    WHERE retrieval_succeeded = 1
-      AND parse_succeeded = 1
-      AND catalog_complete = 1
-)
-SELECT *
-FROM ranked
-WHERE row_number = 1;
-
-CREATE VIEW IF NOT EXISTS current_catalog_by_show AS
-SELECT
-    cr.show_id,
-    cr.observed_at,
-    ao.*,
-    a.media_manager_guid,
-    a.pbs_kids_cms_id,
-    a.legacy_tp_media_id
-FROM latest_complete_catalog_run_by_show AS cr
-JOIN asset_observation AS ao
-  ON ao.run_id = cr.run_id
-JOIN asset AS a
-  ON a.asset_id = ao.asset_id;

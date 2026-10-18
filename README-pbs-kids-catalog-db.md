@@ -1,93 +1,98 @@
 # PBS KIDS catalog database
 
-## Configuration
+## Discovery
 
-The program looks for `pbs_kids_catalog.ini` in the current working directory. If the default file is absent, built-in defaults are used. An explicitly requested missing file is an error.
-
-Use a different file with the global `--config` option:
+`inspect-url` retrieves a catalog page, or reads saved HTML, and reports its structure without onboarding the show or writing observations.
 
 ```bash
-python pbs_kids_catalog_db.py --config /etc/pbs-kids/catalog.ini init
+python pbs_kids_catalog_db.py inspect-url \
+  https://pbskids.org/videos/odd-squad
 ```
 
-Example:
+Use a saved fixture:
 
-```ini
-[application]
-database = data/pbs-kids-catalog.sqlite3
-snapshot_root = data/snapshots
-log_level = INFO
-
-[http]
-timeout_seconds = 30
-user_agent = PBSKidsCatalog/0.2 (+personal catalog synchronization)
-
-[sqlite]
-busy_timeout_ms = 5000
-journal_mode = WAL
-synchronous = NORMAL
+```bash
+python pbs_kids_catalog_db.py inspect-url \
+  https://pbskids.org/videos/odd-squad \
+  --html odd-squad.html
 ```
 
-Relative `database` and `snapshot_root` values are resolved relative to the INI file's directory, not the process working directory. An empty `snapshot_root` disables source snapshots.
+Request structured output:
 
-Precedence is:
+```bash
+python pbs_kids_catalog_db.py inspect-url \
+  https://pbskids.org/videos/odd-squad \
+  --html odd-squad.html \
+  --output-format json
+```
 
-1. command-line option
-2. INI setting
-3. built-in default
+The report includes:
 
-The following stable operational settings can be overridden on the command line:
+- page title and slug;
+- Next.js build ID;
+- total catalog occurrences;
+- unique assets after GUID deduplication;
+- counts by video type;
+- collections and their entry counts;
+- missing identifier and duration counts;
+- sample watch-page URLs;
+- parser warnings;
+- a conservative recommended minimum-asset threshold.
+
+## Onboarding
+
+`onboard-show` performs discovery first and saves the show configuration only if parsing succeeds.
+
+Newly onboarded shows are **disabled by default**. This separates discovery from production scheduling.
+
+```bash
+python pbs_kids_catalog_db.py onboard-show \
+  odd-squad \
+  https://pbskids.org/videos/odd-squad \
+  --html odd-squad.html \
+  --require-collection odd-squad-full-episodes
+```
+
+Enable immediately only after reviewing the discovery report:
+
+```bash
+python pbs_kids_catalog_db.py onboard-show \
+  odd-squad \
+  https://pbskids.org/videos/odd-squad \
+  --html odd-squad.html \
+  --minimum-assets 80 \
+  --frequency daily \
+  --require-collection odd-squad-full-episodes \
+  --enable
+```
+
+If no minimum is supplied, onboarding uses 80 percent of the observed unique-asset count, rounded down with a minimum of one. This is an initial safeguard, not a permanent business rule.
+
+Existing show configuration is protected. Use `--replace` to revise it deliberately. When `--replace` is used, the required-collection list is replaced by the values supplied on that command.
+
+```bash
+python pbs_kids_catalog_db.py onboard-show \
+  odd-squad \
+  https://pbskids.org/videos/odd-squad \
+  --html odd-squad.html \
+  --replace \
+  --enable
+```
+
+## Configuration
+
+The default file is `pbs_kids_catalog.ini`. Override it with:
 
 ```bash
 python pbs_kids_catalog_db.py \
-  --config pbs_kids_catalog.ini \
-  --db /tmp/catalog.sqlite3 \
-  --snapshot-root /tmp/snapshots \
-  --log-level DEBUG \
-  init
+  --config /etc/pbs-kids/catalog.ini \
+  inspect-url https://pbskids.org/videos/odd-squad
 ```
 
-## Initialize and configure
-
-```bash
-python pbs_kids_catalog_db.py init
-
-python pbs_kids_catalog_db.py add-show \
-  odd-squad \
-  https://pbskids.org/videos/odd-squad \
-  --minimum-assets 80 \
-  --frequency daily
-
-python pbs_kids_catalog_db.py require-collection \
-  odd-squad odd-squad-full-episodes
-```
-
-## Update from saved HTML
-
-```bash
-python pbs_kids_catalog_db.py update odd-squad \
-  --html odd-squad.html \
-  --observed-at 2026-10-15T03:22:57.000Z
-```
-
-## Live update
-
-```bash
-python pbs_kids_catalog_db.py update odd-squad
-```
-
-## Inspection
-
-```bash
-python pbs_kids_catalog_db.py list-shows
-python pbs_kids_catalog_db.py runs --key odd-squad
-python pbs_kids_catalog_db.py current odd-squad
-```
+Relative database and snapshot paths are resolved relative to the INI file.
 
 ## Tests
 
 ```bash
-python -m unittest -v test_pbs_kids_catalog_config.py
+python -m unittest -v test_pbs_kids_catalog_onboarding.py
 ```
-
-Phase 2 remains reserved for watch-page details, media profiles, captions, and downloads.
