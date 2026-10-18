@@ -628,9 +628,272 @@ def download_candidate(
     }
 
 
+
+def current_asset_row(
+    connection: sqlite3.Connection,
+    asset_id: int,
+) -> sqlite3.Row | None:
+    """Return an asset from its show's latest complete catalog run."""
+    return connection.execute(
+        """
+        WITH ranked_runs AS
+        (
+            SELECT
+                run_id,
+                show_id,
+                ROW_NUMBER() OVER
+                (
+                    PARTITION BY show_id
+                    ORDER BY observed_at DESC, run_id DESC
+                ) AS run_number
+            FROM catalog_run
+            WHERE retrieval_succeeded = 1
+              AND parse_succeeded = 1
+              AND catalog_complete = 1
+        ),
+        preferred_membership AS
+        (
+            SELECT
+                membership.run_id,
+                membership.asset_id,
+                membership.watch_url,
+                ROW_NUMBER() OVER
+                (
+                    PARTITION BY membership.run_id, membership.asset_id
+                    ORDER BY
+                        collection.slug,
+                        membership.ordinal_position
+                ) AS preferred_number
+            FROM membership_observation AS membership
+            JOIN collection_observation AS collection
+              ON collection.run_id = membership.run_id
+             AND collection.collection_id = membership.collection_id
+        )
+        SELECT
+            configured_show.canonical_key AS show_key,
+            observation.run_id,
+            observation.asset_id,
+            asset.media_manager_guid,
+            observation.title,
+            observation.slug,
+            observation.video_type,
+            observation.duration_seconds,
+            membership.watch_url
+        FROM ranked_runs AS current
+        JOIN show AS configured_show
+          ON configured_show.show_id = current.show_id
+        JOIN asset_observation AS observation
+          ON observation.run_id = current.run_id
+        JOIN asset
+          ON asset.asset_id = observation.asset_id
+        JOIN preferred_membership AS membership
+          ON membership.run_id = observation.run_id
+         AND membership.asset_id = observation.asset_id
+         AND membership.preferred_number = 1
+        WHERE current.run_number = 1
+          AND observation.asset_id = ?
+        """,
+        (asset_id,),
+    ).fetchone()
+
+
+def recorded_artifacts(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return every file currently recorded as a downloaded artifact."""
+    return connection.execute(
+        """
+        SELECT
+            artifact.*,
+            COALESCE
+            (
+                (
+                    SELECT observation.title
+                    FROM asset_observation AS observation
+                    WHERE observation.asset_id = artifact.asset_id
+                    ORDER BY observation.run_id DESC
+                    LIMIT 1
+                ),
+                asset.media_manager_guid,
+                'Asset ' || artifact.asset_id
+            ) AS title
+        FROM download_artifact AS artifact
+        JOIN asset
+          ON asset.asset_id = artifact.asset_id
+        ORDER BY artifact.relative_path
+        """
+    ).fetchall()
+
+
+def inspect_library(
+    connection: sqlite3.Connection,
+    media_root: Path,
+) -> list[dict[str, Any]]:
+    """Check that every recorded artifact exists beneath media_root."""
+    resolved_root = media_root.resolve()
+    results: list[dict[str, Any]] = []
+
+    for artifact in recorded_artifacts(connection):
+        candidate = (resolved_root / artifact["relative_path"]).resolve()
+        try:
+            candidate.relative_to(resolved_root)
+        except ValueError:
+            status = "invalid-path"
+            error = "Recorded path resolves outside media-root."
+        else:
+            if candidate.is_file():
+                status = "present"
+                error = None
+            else:
+                status = "missing"
+                error = "Recorded file is not present."
+
+        results.append(
+            {
+                "download_artifact_id": artifact["download_artifact_id"],
+                "asset_id": artifact["asset_id"],
+                "title": artifact["title"],
+                "relative_path": artifact["relative_path"],
+                "path": str(candidate),
+                "status": status,
+                "error": error,
+                "artifact": dict(artifact),
+            }
+        )
+
+    return results
+
+
+def restore_artifact(
+    connection: sqlite3.Connection,
+    artifact: dict[str, Any],
+) -> None:
+    """Restore the prior artifact row after an unsuccessful re-download."""
+    connection.execute(
+        """
+        INSERT INTO download_artifact
+            (download_artifact_id, asset_id, download_attempt_id,
+             relative_path, file_size_bytes, sha256, container_format,
+             duration_seconds, video_width, video_height, verified_at,
+             verification_status)
+        VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            artifact["download_artifact_id"],
+            artifact["asset_id"],
+            artifact["download_attempt_id"],
+            artifact["relative_path"],
+            artifact["file_size_bytes"],
+            artifact["sha256"],
+            artifact["container_format"],
+            artifact["duration_seconds"],
+            artifact["video_width"],
+            artifact["video_height"],
+            artifact["verified_at"],
+            artifact["verification_status"],
+        ),
+    )
+
+
+def redownload_missing_artifact(
+    connection: sqlite3.Connection,
+    item: dict[str, Any],
+    catalog_settings: catalog_database.Settings,
+    download_settings: DownloadSettings,
+) -> dict[str, Any]:
+    """Re-download a missing artifact when the asset remains available."""
+    row = current_asset_row(connection, item["asset_id"])
+    if row is None:
+        item["status"] = "unavailable"
+        item["error"] = "Asset is not present in a latest complete catalog run."
+        return item
+
+    artifact = item["artifact"]
+    with connection:
+        connection.execute(
+            "DELETE FROM download_artifact WHERE download_artifact_id = ?",
+            (item["download_artifact_id"],),
+        )
+
+    try:
+        result = download_candidate(
+            connection,
+            row,
+            catalog_settings,
+            download_settings,
+            dry_run=False,
+        )
+    except Exception:
+        with connection:
+            restore_artifact(connection, artifact)
+        raise
+
+    if result["status"] != "complete":
+        with connection:
+            restore_artifact(connection, artifact)
+        item["status"] = "redownload-failed"
+        item["error"] = result.get("error") or result["status"]
+        return item
+
+    item["status"] = "redownloaded"
+    item["path"] = result["path"]
+    item["error"] = None
+    return item
+
+
+def print_library_summary(
+    results: list[dict[str, Any]],
+    output_format: str,
+) -> None:
+    """Print library-check results without internal restoration data."""
+    public_results = [
+        {key: value for key, value in item.items() if key != "artifact"}
+        for item in results
+    ]
+    unresolved_statuses = {
+        "missing",
+        "invalid-path",
+        "unavailable",
+        "redownload-failed",
+    }
+    summary = {
+        "recorded": len(results),
+        "present": sum(item["status"] == "present" for item in results),
+        "missing": sum(item["status"] == "missing" for item in results),
+        "redownloaded": sum(
+            item["status"] == "redownloaded" for item in results
+        ),
+        "unresolved": sum(
+            item["status"] in unresolved_statuses for item in results
+        ),
+        "results": public_results,
+    }
+
+    if output_format == "json":
+        print(json.dumps(summary, indent=2, ensure_ascii=False, sort_keys=True))
+        return
+
+    print(
+        f"Recorded={summary['recorded']} "
+        f"present={summary['present']} "
+        f"missing={summary['missing']} "
+        f"redownloaded={summary['redownloaded']} "
+        f"unresolved={summary['unresolved']}"
+    )
+    for item in public_results:
+        if item["status"] != "present":
+            print(f"  {item['status']}: {item['title']} -> {item['path']}")
+            if item.get("error"):
+                print(f"    {item['error']}")
+
 def build_cli(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download available PBS KIDS videos missing from the local library."
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=("download", "check-library"),
+        default="download",
     )
     parser.add_argument("--db", type=Path)
     parser.add_argument("--media-root", type=Path)
@@ -639,6 +902,11 @@ def build_cli(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--video-type", action="append", default=[])
     parser.add_argument("--limit", type=int)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--redownload",
+        action="store_true",
+        help="Re-download missing recorded files when the asset is available.",
+    )
     parser.add_argument("--output-format", choices=("text", "json"), default="text")
     return parser.parse_args(argv)
 
@@ -671,6 +939,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         catalog_database.initialize_database(database, catalog_settings)
         with catalog_database.connect(database, catalog_settings) as connection:
             ensure_download_schema(connection)
+
+            if args.command == "check-library":
+                results = inspect_library(connection, download_settings.media_root)
+                if args.redownload:
+                    results = [
+                        redownload_missing_artifact(
+                            connection,
+                            item,
+                            catalog_settings,
+                            download_settings,
+                        )
+                        if item["status"] == "missing"
+                        else item
+                        for item in results
+                    ]
+                print_library_summary(results, args.output_format)
+                unresolved_statuses = {
+                    "missing",
+                    "invalid-path",
+                    "unavailable",
+                    "redownload-failed",
+                }
+                return 1 if any(
+                    item["status"] in unresolved_statuses for item in results
+                ) else 0
+
+            if args.redownload:
+                raise ValueError("--redownload is valid only with check-library.")
+
             video_types = tuple(args.video_type) or download_settings.video_types
             query, parameters = candidate_query(video_types)
             rows = connection.execute(query, parameters).fetchall()
