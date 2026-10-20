@@ -53,7 +53,19 @@ class DryRunAvailabilityTests(unittest.TestCase):
         self.connection.close(); self.temporary.cleanup()
 
     def run_dry(self, page, drm_is_new=False, expect_availability=True):
-        with patch("pbs_kids_video_download.fetch_watch_page", return_value=(page, 200)), patch("pbs_kids_video_download.record_watch_observation", return_value=10) as watch, patch("pbs_kids_video_download.record_media_availability", return_value=drm_is_new) as availability:
+        with patch(
+            "pbs_kids_video_download.fetch_watch_page",
+            return_value=("<html></html>", 200),
+        ), patch(
+            "pbs_kids_video_download.watch_parser.parse_watch_page",
+            return_value=page,
+        ), patch(
+            "pbs_kids_video_download.record_watch_observation",
+            return_value=10,
+        ) as watch, patch(
+            "pbs_kids_video_download.record_media_availability",
+            return_value=drm_is_new,
+        ) as availability:
             result = download_candidate(self.connection, self.row, object(), self.settings, dry_run=True)
         watch.assert_called_once()
         if expect_availability:

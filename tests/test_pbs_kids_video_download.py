@@ -3,6 +3,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+import unittest.mock
 
 import pbs_kids_catalog_db as catalog_database
 import pbs_kids_video_download as downloader
@@ -175,13 +176,18 @@ class DownloadCandidateTests(unittest.TestCase):
         self.assertIsNotNone(row)
 
         settings = downloader.load_download_settings(self.config)
-        result = downloader.download_candidate(
-            self.connection,
-            row,
-            self.settings,
-            settings,
-            dry_run=True,
-        )
+        parsed = watch_parser.parse_watch_page(watch_html())
+        with unittest.mock.patch(
+            "pbs_kids_video_download.fetch_watch_page",
+            return_value=(watch_html(), 200),
+        ):
+            result = downloader.download_candidate(
+                self.connection,
+                row,
+                self.settings,
+                settings,
+                dry_run=True,
+            )
         self.assertEqual(result["status"], "would-download")
         self.assertIn("Episode One [1].mp4", result["path"])
 
