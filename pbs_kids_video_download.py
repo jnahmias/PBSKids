@@ -121,6 +121,38 @@ def load_download_settings(config_path: Path) -> DownloadSettings:
 def ensure_download_schema(connection: sqlite3.Connection) -> None:
     schema = (HERE / "pbs_kids_video_schema.sql").read_text(encoding="utf-8")
     connection.executescript(schema)
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS asset_media_availability_observation
+        (
+            availability_observation_id  INTEGER PRIMARY KEY,
+            asset_id                    INTEGER NOT NULL,
+            watch_observation_id        INTEGER NOT NULL UNIQUE,
+            observed_at                 TEXT NOT NULL,
+            availability_state          TEXT NOT NULL
+                                        CHECK
+                                        (
+                                            availability_state IN
+                                            (
+                                                'unavailable',
+                                                'drm',
+                                                'non_drm'
+                                            )
+                                        ),
+
+            FOREIGN KEY (asset_id)
+                REFERENCES asset(asset_id),
+
+            FOREIGN KEY (watch_observation_id)
+                REFERENCES watch_page_observation(watch_observation_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS
+            ix_asset_media_availability_asset_time
+        ON asset_media_availability_observation
+            (asset_id, availability_observation_id DESC);
+        """
+    )
 
 
 def sanitize_component(value: str, maximum_length: int = 120) -> str:
@@ -400,6 +432,60 @@ def record_watch_observation(
     return observation_id
 
 
+
+def classify_media_availability(
+    parsed: watch_parser.WatchPage,
+) -> str:
+    """Classify the current watch page as unavailable, DRM, or non-DRM."""
+    profiles = tuple(parsed.media_profiles)
+    if not profiles:
+        return "unavailable"
+
+    if parsed.drm_enabled:
+        return "drm"
+
+    if any(not profile.has_drm_license for profile in profiles):
+        return "non_drm"
+
+    return "drm"
+
+
+def record_media_availability(
+    connection: sqlite3.Connection,
+    asset_id: int,
+    watch_observation_id: int,
+    availability_state: str,
+) -> bool:
+    """Record state and return whether DRM is a newly entered condition."""
+    previous = connection.execute(
+        """
+        SELECT availability_state
+        FROM asset_media_availability_observation
+        WHERE asset_id = ?
+        ORDER BY availability_observation_id DESC
+        LIMIT 1
+        """,
+        (asset_id,),
+    ).fetchone()
+    previous_state = previous[0] if previous else None
+
+    connection.execute(
+        """
+        INSERT INTO asset_media_availability_observation
+            (asset_id, watch_observation_id, observed_at, availability_state)
+        VALUES
+            (?, ?, ?, ?)
+        """,
+        (
+            asset_id,
+            watch_observation_id,
+            utc_now(),
+            availability_state,
+        ),
+    )
+
+    return availability_state == "drm" and previous_state != "drm"
+
 def download_candidate(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
@@ -464,12 +550,25 @@ def download_candidate(
             "error": str(exc),
         }
 
+    availability_state = classify_media_availability(parsed)
+    with connection:
+        drm_condition_is_new = record_media_availability(
+            connection,
+            row["asset_id"],
+            watch_observation_id,
+            availability_state,
+        )
+
     chosen = watch_parser.choose_media_profile(
         parsed,
         list(download_settings.preferred_profiles),
     )
     if chosen is None:
-        reason = "DRM-protected or no non-DRM media profile is available."
+        if availability_state == "drm":
+            reason = "All currently available media streams are DRM-protected."
+        else:
+            reason = "No media streams are currently available."
+        warning = reason if drm_condition_is_new else None
         with connection:
             connection.execute(
                 """
@@ -493,7 +592,9 @@ def download_candidate(
             "title": row["title"],
             "status": "skipped",
             "path": str(destination),
-            "error": reason,
+            "availability_state": availability_state,
+            "drm_warning": drm_condition_is_new,
+            "error": warning,
         }
 
     if shutil.which(download_settings.yt_dlp_command) is None:
@@ -623,6 +724,8 @@ def download_candidate(
         "status": "complete",
         "path": str(destination),
         "profile": chosen.profile,
+        "availability_state": availability_state,
+        "drm_warning": False,
         "verification_status": verification["verification_status"],
         "error": None,
     }
