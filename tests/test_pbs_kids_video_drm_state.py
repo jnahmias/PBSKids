@@ -38,6 +38,7 @@ from pbs_kids_video_download import (  # noqa: E402
 class DrmStateTransitionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.connection = sqlite3.connect(":memory:")
+        self.addCleanup(self.connection.close)
         self.connection.executescript(
             """
             CREATE TABLE asset_media_availability_observation
