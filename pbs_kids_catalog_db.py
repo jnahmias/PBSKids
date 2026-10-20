@@ -455,6 +455,55 @@ def resolve_asset(
     return int(cursor.lastrowid)
 
 
+
+def count_new_full_episodes(
+    connection: sqlite3.Connection,
+    show_id: int,
+    run_id: int,
+) -> int:
+    """Count full episodes first observed in this complete show catalog run.
+
+    Assets seen in any earlier successful, complete run for the same show are
+    not new. Returning rotated episodes are therefore not counted again.
+    """
+    row = connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM asset_observation AS current_observation
+        JOIN catalog_run AS current_run
+          ON current_run.run_id = current_observation.run_id
+        WHERE current_observation.run_id = ?
+          AND current_run.show_id = ?
+          AND current_run.retrieval_succeeded = 1
+          AND current_run.parse_succeeded = 1
+          AND current_run.catalog_complete = 1
+          AND current_observation.video_type = 'fullEpisode'
+          AND NOT EXISTS
+          (
+              SELECT 1
+              FROM asset_observation AS prior_observation
+              JOIN catalog_run AS prior_run
+                ON prior_run.run_id = prior_observation.run_id
+              WHERE prior_observation.asset_id = current_observation.asset_id
+                AND prior_run.show_id = current_run.show_id
+                AND prior_run.retrieval_succeeded = 1
+                AND prior_run.parse_succeeded = 1
+                AND prior_run.catalog_complete = 1
+                AND
+                (
+                    prior_run.observed_at < current_run.observed_at
+                    OR
+                    (
+                        prior_run.observed_at = current_run.observed_at
+                        AND prior_run.run_id < current_run.run_id
+                    )
+                )
+          )
+        """,
+        (run_id, show_id),
+    ).fetchone()
+    return int(row[0])
+
 def ingest_catalog_run(
     connection: sqlite3.Connection,
     show: sqlite3.Row,
@@ -661,6 +710,11 @@ def ingest_catalog_run(
             """,
             (int(complete), "; ".join(errors) or None, run_id),
         )
+        new_full_episodes = count_new_full_episodes(
+            connection,
+            int(show["show_id"]),
+            run_id,
+        )
 
     return {
         "show": show["canonical_key"],
@@ -670,6 +724,7 @@ def ingest_catalog_run(
         "assets": parsed.metadata.unique_asset_count,
         "collections": len(parsed.collections),
         "memberships": membership_count,
+        "new_full_episodes": new_full_episodes,
         "error": "; ".join(errors) or None,
     }
 
@@ -747,6 +802,7 @@ def update_one_show(
                 "assets": 0,
                 "collections": 0,
                 "memberships": 0,
+                "new_full_episodes": 0,
                 "error": str(exc),
             }
 
@@ -797,11 +853,13 @@ def update_all_shows(
         results.append(result)
         if result["success"]:
             LOG.info(
-                "Updated show=%s run_id=%s assets=%s complete=%s",
+                "Updated show=%s run_id=%s assets=%s complete=%s "
+                "new_full_episodes=%s",
                 show_key,
                 result["run_id"],
                 result["assets"],
                 result["catalog_complete"],
+                result["new_full_episodes"],
             )
         else:
             LOG.error(
@@ -843,7 +901,8 @@ def print_update_summary(
             status = "INCOMPLETE"
         line = (
             f"  {result['show']}: {status}; "
-            f"run_id={result['run_id']}; assets={result['assets']}"
+            f"run_id={result['run_id']}; assets={result['assets']}; "
+            f"new_full_episodes={result['new_full_episodes']}"
         )
         if result["error"]:
             line += f"; {result['error']}"
