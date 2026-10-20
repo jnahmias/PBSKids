@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 import tempfile, unittest
 import pbs_kids_catalog_db as app
 
@@ -36,6 +37,28 @@ class ConfigTests(unittest.TestCase):
     def test_missing_explicit_config_fails(self):
         with self.assertRaises(ValueError):
             app.load_settings(["--config", "/definitely/missing.ini", "init"])
+
+
+    def test_managed_connection_can_be_closed_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "catalog.sqlite3"
+            config = Path(directory) / "test.ini"
+            config.write_text(
+                f"[application]\ndatabase={database}\n",
+                encoding="utf-8",
+            )
+            settings, _ = app.load_settings(
+                ["--config", str(config), "init"]
+            )
+            app.initialize_database(database, settings)
+
+            connection = app.connect(database, settings)
+            connection.execute("SELECT 1").fetchone()
+            connection.close()
+            connection.close()
+
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1").fetchone()
 
 
 if __name__ == "__main__":

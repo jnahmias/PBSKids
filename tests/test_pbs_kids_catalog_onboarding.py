@@ -132,6 +132,7 @@ class OnboardingTests(unittest.TestCase):
 
     def test_existing_show_requires_replace(self):
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.row_factory = sqlite3.Row
         connection.execute(
             """

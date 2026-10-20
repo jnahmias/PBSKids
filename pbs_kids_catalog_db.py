@@ -139,11 +139,28 @@ def load_settings(argv: Sequence[str] | None = None) -> tuple[Settings, list[str
     return settings, remaining
 
 
+class ManagedConnection(sqlite3.Connection):
+    """SQLite connection with a defensive finalizer.
+
+    sqlite3.Connection transaction contexts commit or roll back but do not
+    close the underlying handle. Callers should still close directly owned
+    connections; this finalizer is a safety net that closes a connection before
+    Python 3.13 reports it as an unclosed database during garbage collection.
+    """
+
+    def __del__(self):
+        try:
+            self.close()
+        except sqlite3.ProgrammingError:
+            pass
+
+
 def connect(database: Path, settings: Settings) -> sqlite3.Connection:
     database.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(
         database,
         timeout=settings.busy_timeout_ms / 1000,
+        factory=ManagedConnection,
     )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
