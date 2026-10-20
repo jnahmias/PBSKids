@@ -1,0 +1,118 @@
+name: Publish repository Git bundle
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    # Refresh the release asset weekly even if main has not changed.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-repository-git-bundle
+  cancel-in-progress: true
+
+env:
+  BUNDLE_NAME: PBSKids-latest.bundle
+  CHECKSUM_NAME: PBSKids-latest.bundle.sha256
+  RELEASE_TAG: repository-bundle
+
+jobs:
+  publish-bundle:
+    name: Create, verify, and publish bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out complete repository history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: true
+
+      - name: Fetch every branch and tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # checkout fetch-depth: 0 provides full history for the triggering
+          # ref. This explicit refspec also captures branches other than main.
+          git fetch --force --prune origin \
+            '+refs/heads/*:refs/remotes/origin/*' \
+            '+refs/tags/*:refs/tags/*'
+
+      - name: Create and verify the Git bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          git bundle create "dist/${BUNDLE_NAME}" --all
+
+          # git bundle verify requires an existing repository as its working
+          # directory. The checked-out repository supplies that context.
+          git bundle verify "dist/${BUNDLE_NAME}"
+
+          (
+            cd dist
+            sha256sum "${BUNDLE_NAME}" > "${CHECKSUM_NAME}"
+          )
+
+          # Confirm that a clean clone can be created from the exact artifact.
+          git clone --quiet "dist/${BUNDLE_NAME}" bundle-validation-clone
+          test -n "$(git -C bundle-validation-clone rev-parse HEAD)"
+          test "$(git -C bundle-validation-clone rev-parse HEAD)" = \
+               "$(git rev-parse HEAD)"
+
+      - name: Create the bundle release when absent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --target "${GITHUB_SHA}" \
+              --title "Latest repository Git bundle" \
+              --notes "Automatically maintained full-history Git bundle. The release tag is a stable publishing anchor; the attached bundle is replaced after each update to main."
+          fi
+
+      - name: Replace downloadable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release upload "${RELEASE_TAG}" \
+            "dist/${BUNDLE_NAME}" \
+            "dist/${CHECKSUM_NAME}" \
+            --clobber
+
+      - name: Add bundle details to workflow summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${BUNDLE_NAME}"
+          checksum_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${CHECKSUM_NAME}"
+
+          {
+            echo "## Repository Git bundle"
+            echo
+            echo "- Bundle: [${BUNDLE_NAME}](${bundle_url})"
+            echo "- SHA-256: [${CHECKSUM_NAME}](${checksum_url})"
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+            echo
+            echo "Restore with:"
+            echo
+            echo '```bash'
+            echo "git clone ${BUNDLE_NAME} PBSKids"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
