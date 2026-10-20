@@ -1,3 +1,10 @@
+# project-specific ignores
+
+## data directory storing sqlite database and archived web snapshots
+data/
+
+# From: https://github.com/github/gitignore/blob/ce1ed77154d0541be95b4ebbcbe80589eb0d9f66/Python.gitignore
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
