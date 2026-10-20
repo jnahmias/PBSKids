@@ -503,15 +503,6 @@ def download_candidate(
             "error": "Target file already exists but is not recorded in the database.",
         }
 
-    if dry_run:
-        return {
-            "asset_id": row["asset_id"],
-            "title": row["title"],
-            "status": "would-download",
-            "path": str(destination),
-            "watch_url": row["watch_url"],
-        }
-
     html: str | None = None
     parsed: watch_parser.WatchPage | None = None
     try:
@@ -563,6 +554,36 @@ def download_candidate(
         parsed,
         list(download_settings.preferred_profiles),
     )
+
+    if dry_run:
+        if chosen is None:
+            if availability_state == "drm":
+                reason = "All currently available media streams are DRM-protected."
+            else:
+                reason = "No media streams are currently available."
+            return {
+                "asset_id": row["asset_id"],
+                "title": row["title"],
+                "status": "would-skip",
+                "path": str(destination),
+                "watch_url": row["watch_url"],
+                "availability_state": availability_state,
+                "drm_warning": drm_condition_is_new,
+                "error": reason if drm_condition_is_new else None,
+            }
+
+        return {
+            "asset_id": row["asset_id"],
+            "title": row["title"],
+            "status": "would-download",
+            "path": str(destination),
+            "watch_url": row["watch_url"],
+            "profile": chosen.profile,
+            "source_url": chosen.redirect_url,
+            "availability_state": availability_state,
+            "drm_warning": False,
+            "error": None,
+        }
     if chosen is None:
         if availability_state == "drm":
             reason = "All currently available media streams are DRM-protected."
@@ -1099,6 +1120,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "would_download": sum(
                 item["status"] == "would-download" for item in results
             ),
+            "would_skip": sum(
+                item["status"] == "would-skip" for item in results
+            ),
             "results": results,
         }
         if args.output_format == "json":
@@ -1109,7 +1133,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"complete={summary['complete']} "
                 f"skipped={summary['skipped']} "
                 f"failed={summary['failed']} "
-                f"would-download={summary['would_download']}"
+                f"would-download={summary['would_download']} "
+                f"would-skip={summary['would_skip']}"
             )
             for item in results:
                 print(f"  {item['status']}: {item['title']} -> {item['path']}")
